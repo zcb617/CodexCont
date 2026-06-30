@@ -1,5 +1,7 @@
 # CodexCont
 
+[English](README.md) · [中文](README_zh.md)
+
 Continue-thinking middleware for Codex / OpenAI Responses-compatible APIs.
 
 This project is a small Starlette proxy that sits between a coding agent and an upstream Responses endpoint. It detects a known reasoning-truncation fingerprint (`usage.output_tokens_details.reasoning_tokens == 518 * n - 2`), silently asks the model to continue thinking, and folds multiple upstream streaming responses into one coherent downstream SSE response.
