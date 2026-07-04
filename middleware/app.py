@@ -9,13 +9,16 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from typing import Any
+import time
+import uuid
+from typing import Any, AsyncIterator, Iterable
 
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .codex import (
     build_round_payload,
@@ -26,6 +29,7 @@ from .codex import (
 from .config import Config
 from .creds import build_upstream_headers, would_inject_authorization
 from .proxy import fold_stream, open_passthrough, open_round
+from .sse import DONE, incremental_sse
 from .store import IdStore
 
 log = logging.getLogger("middleware.app")
@@ -71,6 +75,172 @@ def _url_is_from_header(cfg: Config, request: Request) -> bool:
     return cfg.upstream.mode in ("header", "header_required") and _header_base(request) is not None
 
 
+def _collision(cfg: Config, body: dict[str, Any]) -> bool:
+    return (
+        cfg.cont.method == "tool_pair"
+        and declares_continue_tool(body, cfg.cont.continue_tool_name)
+    )
+
+
+def _should_fold(cfg: Config, body: dict[str, Any]) -> bool:
+    return (
+        cfg.cont.enabled
+        and bool(body.get("stream"))
+        and reasoning_enabled(body)
+        and not _collision(cfg, body)
+    )
+
+
+def _passthrough_reason(cfg: Config, body: dict[str, Any]) -> str:
+    if not cfg.cont.enabled:
+        return "disabled"
+    if not body.get("stream"):
+        return "non-stream"
+    if not reasoning_enabled(body):
+        return "non-reasoning"
+    return "declares-continue_thinking"
+
+
+def _header_override_error(
+    cfg: Config,
+    request: Request | WebSocket,
+    *,
+    model: Any,
+) -> str | None:
+    if _url_is_from_header(cfg, request) and would_inject_authorization(
+        cfg, agent_has_authorization=request.headers.get("authorization") is not None
+    ):
+        log.warning("blocked: Responses-API-Base override without own auth (model=%s)", model)
+        return (
+            "When overriding the upstream base (Responses-API-Base), the request must provide "
+            "its own Authorization; the proxy will not send its configured credentials to an "
+            "externally supplied URL."
+        )
+    return None
+
+
+async def _iter_sse_events(byte_iter: AsyncIterator[bytes]) -> AsyncIterator[dict[str, Any]]:
+    async for ev in incremental_sse(byte_iter):
+        if ev is DONE or not isinstance(ev, dict):
+            continue
+        yield ev
+
+
+def _json_body_bytes(body: dict[str, Any]) -> bytes:
+    return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+
+def _ensure_header(headers: dict[str, str], name: str, value: str) -> None:
+    if not any(k.lower() == name.lower() for k in headers):
+        headers[name] = value
+
+
+def _ws_upstream_headers(headers: Iterable[tuple[str, str]], cfg: Config) -> dict[str, str]:
+    out = build_upstream_headers(headers, cfg)
+    _ensure_header(out, "Content-Type", "application/json")
+    return out
+
+
+def _ws_error_event(
+    message: str,
+    *,
+    status: int = 400,
+    code: str = "invalid_request_error",
+    param: str | None = None,
+) -> dict[str, Any]:
+    err: dict[str, Any] = {"type": "invalid_request_error", "code": code, "message": message}
+    if param is not None:
+        err["param"] = param
+    return {"type": "error", "status": status, "error": err}
+
+
+def _upstream_error_event(raw: bytes, status: int) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        text = raw.decode("utf-8", errors="replace")[:1000] or "Upstream error"
+        return _ws_error_event(text, status=status, code="upstream_error")
+
+    if isinstance(parsed, dict):
+        if parsed.get("type") == "error":
+            return parsed
+        return {"type": "error", "status": status, **parsed}
+
+    return _ws_error_event(str(parsed), status=status, code="upstream_error")
+
+
+def _is_ws_warmup(body: dict[str, Any]) -> bool:
+    return body.get("generate") is False
+
+
+async def _open_json_request(
+    client: httpx.AsyncClient,
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+) -> httpx.Response:
+    req = client.build_request(
+        "POST",
+        url,
+        content=_json_body_bytes(body),
+        headers=headers,
+        timeout=None,
+    )
+    return await client.send(req, stream=False)
+
+
+def _terminal_type_for_response(resp: dict[str, Any]) -> str:
+    status = resp.get("status")
+    if status == "failed":
+        return "response.failed"
+    if status == "incomplete":
+        return "response.incomplete"
+    return "response.completed"
+
+
+def _warmup_events_from_response(resp: dict[str, Any]) -> list[dict[str, Any]]:
+    response = dict(resp)
+    response.setdefault("status", "completed")
+    return [
+        {"type": "response.created", "response": response, "sequence_number": 0},
+        {"type": _terminal_type_for_response(response), "response": response, "sequence_number": 1},
+    ]
+
+
+def _local_warmup_response(body: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": f"resp_warmup_{uuid.uuid4().hex}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": body.get("model"),
+        "output": [],
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+
+
+def _merge_warmup_body(warmup: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(warmup)
+    warmup_input = list(warmup.get("input") or [])
+    current_input = list(current.get("input") or [])
+
+    merged.pop("generate", None)
+    merged.pop("input", None)
+    merged.pop("previous_response_id", None)
+
+    for k, v in current.items():
+        if k not in ("input", "previous_response_id", "generate"):
+            merged[k] = v
+
+    if warmup_input or current_input:
+        merged["input"] = warmup_input + current_input
+    return merged
+
+
 async def _passthrough(
     client: httpx.AsyncClient, cfg: Config, request: Request, raw: bytes, url: str
 ):
@@ -111,41 +281,15 @@ async def handle_responses(request: Request) -> Response:
             status_code=400,
         )
 
-    # Safety: never send the proxy's configured credentials to a URL the request
-    # itself supplied. If the base came from the header, the request must carry
-    # its own Authorization (we won't inject ours toward an external URL).
-    if _url_is_from_header(cfg, request) and would_inject_authorization(
-        cfg, agent_has_authorization=request.headers.get("authorization") is not None
-    ):
-        log.warning("blocked: Responses-API-Base override without own auth (model=%s)",
-                    body.get("model"))
+    if err := _header_override_error(cfg, request, model=body.get("model")):
         return JSONResponse(
-            {"error": "When overriding the upstream base (Responses-API-Base), the request must "
-                      "provide its own Authorization; the proxy will not send its configured "
-                      "credentials to an externally supplied URL."},
+            {"error": err},
             status_code=400,
         )
 
-    # Fold only a streaming, reasoning-enabled request that isn't a collision.
-    # Everything else (non-reasoning, non-streaming, continuation disabled, or
-    # the agent declaring its own continue_thinking) is a pure passthrough.
-    # The collision rule only matters for the tool_pair method (we inject a tool);
-    # commentary injects no tool, so a declared continue_thinking is irrelevant.
-    collision = (
-        cfg.cont.method == "tool_pair"
-        and declares_continue_tool(body, cfg.cont.continue_tool_name)
-    )
-    should_fold = (
-        cfg.cont.enabled
-        and bool(body.get("stream"))
-        and reasoning_enabled(body)
-        and not collision
-    )
+    should_fold = _should_fold(cfg, body)
     if not should_fold:
-        why = ("disabled" if not cfg.cont.enabled
-               else "non-stream" if not body.get("stream")
-               else "non-reasoning" if not reasoning_enabled(body)
-               else "declares-continue_thinking")
+        why = _passthrough_reason(cfg, body)
         log.info("passthrough (%s): model=%s path=%s url=%s",
                  why, body.get("model"), request.url.path, url)
         return await _passthrough(client, cfg, request, raw, url)
@@ -190,6 +334,116 @@ async def handle_responses(request: Request) -> Response:
     )
 
 
+async def handle_responses_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+    cfg: Config = websocket.app.state.cfg
+    client: httpx.AsyncClient = websocket.app.state.client
+    warmups: dict[str, dict[str, Any]] = {}
+
+    while True:
+        try:
+            msg = await websocket.receive_json()
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            await websocket.send_json(
+                _ws_error_event("Expected a JSON response.create event.", param="type")
+            )
+            continue
+
+        if not isinstance(msg, dict):
+            await websocket.send_json(
+                _ws_error_event("Expected a JSON object.", param="type")
+            )
+            continue
+        if msg.get("type") != "response.create":
+            await websocket.send_json(
+                _ws_error_event(
+                    "Unsupported event type. Send response.create.",
+                    param="type",
+                )
+            )
+            continue
+
+        body = {k: v for k, v in msg.items() if k != "type"}
+        body.pop("background", None)
+        warmup = _is_ws_warmup(body)
+        if not warmup:
+            body["stream"] = True
+            prev_id = body.get("previous_response_id")
+            if isinstance(prev_id, str) and prev_id in warmups:
+                body = _merge_warmup_body(warmups.pop(prev_id), body)
+
+        url = _resolve_upstream_url(cfg, websocket)
+        if url is None:
+            await websocket.send_json(
+                _ws_error_event(
+                    "Responses-API-Base header is required (upstream mode=header_required)"
+                )
+            )
+            continue
+        if err := _header_override_error(cfg, websocket, model=body.get("model")):
+            await websocket.send_json(_ws_error_event(err))
+            continue
+
+        headers = _ws_upstream_headers(websocket.headers.items(), cfg)
+        should_fold = (not warmup) and _should_fold(cfg, body)
+
+        if warmup:
+            log.info("warmup(ws): model=%s path=%s url=%s input_items=%d local_state=1",
+                     body.get("model"), websocket.url.path, url, len(body.get("input") or []))
+            resp_obj = _local_warmup_response(body)
+            warmups[resp_obj["id"]] = dict(body)
+            for ev in _warmup_events_from_response(resp_obj):
+                await websocket.send_json(ev)
+            continue
+        elif should_fold:
+            log.info("fold start(ws): model=%s path=%s url=%s input_items=%d",
+                     body.get("model"), websocket.url.path, url, len(body.get("input") or []))
+            payload = build_round_payload(
+                body,
+                input_items=list(body.get("input") or []),
+                force_include_encrypted=cfg.stream.force_include_encrypted,
+                drop_previous_response_id=False,
+            )
+            resp = await open_round(client, url, payload, headers)
+        else:
+            why = _passthrough_reason(cfg, body)
+            log.info("passthrough(ws) (%s): model=%s path=%s url=%s",
+                     why, body.get("model"), websocket.url.path, url)
+            resp = await open_passthrough(client, url, _json_body_bytes(body), headers)
+
+        if resp.status_code >= 400:
+            err = await resp.aread()
+            await resp.aclose()
+            await websocket.send_json(_upstream_error_event(err, resp.status_code))
+            continue
+
+        try:
+            if should_fold:
+                event_iter = _iter_sse_events(
+                    fold_stream(
+                        client,
+                        cfg,
+                        body,
+                        headers,
+                        resp,
+                        websocket.app.state.id_store,
+                        url=url,
+                    )
+                )
+                async for ev in event_iter:
+                    await websocket.send_json(ev)
+            else:
+                try:
+                    async for ev in _iter_sse_events(resp.aiter_bytes()):
+                        await websocket.send_json(ev)
+                finally:
+                    await resp.aclose()
+        except WebSocketDisconnect:
+            return
+
+
 def _make_client() -> httpx.AsyncClient:
     """A client that does NOT invent a User-Agent or Accept of its own; those
     are forwarded from the agent or omitted. httpx still manages Host /
@@ -215,4 +469,7 @@ def create_app(cfg: Config) -> Starlette:
     routes = [
         Route(path, handle_responses, methods=["POST"]) for path in cfg.server.listen_paths
     ]
+    routes.extend(
+        WebSocketRoute(path, handle_responses_ws) for path in cfg.server.listen_paths
+    )
     return Starlette(routes=routes, lifespan=lifespan)

@@ -36,6 +36,7 @@ Runtime dependencies are declared in `pyproject.toml`:
 - `httpx`
 - `starlette`
 - `uvicorn`
+- `websockets`
 
 ## Quick start
 

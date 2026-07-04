@@ -25,6 +25,11 @@ _CLIENT_OWNED = {
     "proxy-connection",
     "transfer-encoding",
     "accept-encoding",
+    "upgrade",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+    "sec-websocket-protocol",
 }
 
 _AUTH = "authorization"

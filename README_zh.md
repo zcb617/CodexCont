@@ -34,6 +34,7 @@
 - `httpx`
 - `starlette`
 - `uvicorn`
+- `websockets`
 
 ## 快速开始
 

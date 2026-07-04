@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sse.txt
+tests/
+gptpoc.egg-info/
+INSTALL-GUIDE-AGENT/
+config.toml
+package-lock.json

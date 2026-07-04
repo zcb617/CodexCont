@@ -17,8 +17,9 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(ROOT))
 
 from starlette.datastructures import Headers
+from starlette.testclient import TestClient
 
-from middleware.app import _make_client, _resolve_upstream_url, _url_is_from_header
+from middleware.app import create_app, _make_client, _resolve_upstream_url, _url_is_from_header
 from middleware.codex import (
     continue_call_id,
     is_truncation_pattern,
@@ -96,6 +97,9 @@ class FakeClient:
         r = self._responses[self._i]
         self._i += 1
         return r
+
+    async def aclose(self) -> None:
+        pass
 
 
 async def run_fold(cfg, base_body, first_resp, later_resps) -> list:
@@ -394,6 +398,8 @@ def test_header_transparency():
         ("Accept-Encoding", "gzip"),
         ("Responses-API-Base", "https://override/responses"),
         ("X-Custom", "keep"),
+        ("Upgrade", "websocket"),
+        ("Sec-WebSocket-Key", "drop"),
     ]
     out = build_upstream_headers(agent, cfg)
     low = {k.lower(): v for k, v in out.items()}
@@ -401,7 +407,14 @@ def test_header_transparency():
     check("hdr keeps user-agent", low.get("user-agent") == "codex_cli_rs/1.0")
     check("hdr keeps custom", low.get("x-custom") == "keep")
     check("hdr keeps authorization", low.get("authorization") == "Bearer agent")
-    for dropped in ("host", "content-length", "accept-encoding", "responses-api-base"):
+    for dropped in (
+        "host",
+        "content-length",
+        "accept-encoding",
+        "responses-api-base",
+        "upgrade",
+        "sec-websocket-key",
+    ):
         check(f"hdr drops {dropped}", dropped not in low)
 
 
@@ -611,6 +624,83 @@ async def test_eof_incomplete():
           str([it.get("type") for it in out_items]))
 
 
+def test_websocket_route_streams_events():
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    resp = FakeResp(_round("rs_ws", "ENC_WS", 999, msg="done"))
+
+    with TestClient(app) as client:
+        app.state.client = FakeClient([resp])
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "input": [{"role": "user", "content": "q"}],
+                }
+            )
+            evs = []
+            while True:
+                ev = ws.receive_json()
+                evs.append(ev)
+                if ev.get("type") in ("response.completed", "response.failed", "response.incomplete"):
+                    break
+
+    types = [e.get("type") for e in evs]
+    check("ws route emits created", "response.created" in types, str(types[:4]))
+    check("ws route emits terminal", "response.completed" in types, str(types[-2:]))
+    deltas = "".join(e.get("delta", "") for e in evs if e.get("type") == "response.output_text.delta")
+    check("ws route forwards text delta", deltas == "done", deltas)
+
+
+def test_websocket_warmup_generate_false():
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    client_stub = FakeClient([FakeResp(_round("rs_after_warm", "ENC", 999, msg="after warmup"))])
+
+    with TestClient(app) as client:
+        app.state.client = client_stub
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "generate": False,
+                    "tools": [{"type": "function", "name": "shell"}],
+                    "input": [{"type": "message", "role": "developer", "content": "warm"}],
+                }
+            )
+            ev1 = ws.receive_json()
+            ev2 = ws.receive_json()
+            warm_id = (ev2.get("response") or {}).get("id")
+            ws.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "previous_response_id": warm_id,
+                    "input": [{"role": "user", "content": "run"}],
+                }
+            )
+            while True:
+                ev = ws.receive_json()
+                if ev.get("type") in ("response.completed", "response.failed", "response.incomplete"):
+                    break
+
+    check("ws warmup emits created", ev1.get("type") == "response.created", str(ev1))
+    check("ws warmup emits completed", ev2.get("type") == "response.completed", str(ev2))
+    check("ws warmup returns synthetic response id",
+          str((ev2.get("response") or {}).get("id")).startswith("resp_warmup_"),
+          str((ev2.get("response") or {}).get("id")))
+    merged = client_stub.payloads[0] if client_stub.payloads else {}
+    minput = merged.get("input") or []
+    check("ws warmup merges cached input into next upstream request", len(minput) == 2, str(minput))
+    check("ws warmup preserves cached tools on next upstream request",
+          (merged.get("tools") or [{}])[0].get("name") == "shell",
+          str(merged.get("tools")))
+    check("ws warmup strips synthetic previous_response_id before upstream",
+          "previous_response_id" not in merged, str(merged))
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -629,6 +719,8 @@ async def _main():
     test_reasoning_gate()
     test_stateful_repair()
     await test_eof_incomplete()
+    test_websocket_route_streams_events()
+    test_websocket_warmup_generate_false()
 
 
 def main():
