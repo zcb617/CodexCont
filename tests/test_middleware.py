@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -701,6 +703,112 @@ def test_websocket_warmup_generate_false():
           "previous_response_id" not in merged, str(merged))
 
 
+def test_websocket_strips_previous_response_id_for_codex_backend():
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    client_stub = FakeClient([FakeResp(_round("rs_prev", "ENC", 999, msg="done"))])
+
+    with TestClient(app) as client:
+        app.state.client = client_stub
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "previous_response_id": "resp_existing",
+                    "input": [{"role": "user", "content": "continue"}],
+                }
+            )
+            while True:
+                ev = ws.receive_json()
+                if ev.get("type") in ("response.completed", "response.failed", "response.incomplete"):
+                    break
+
+    sent = client_stub.payloads[0] if client_stub.payloads else {}
+    check("ws strips unsupported previous_response_id before codex upstream",
+          "previous_response_id" not in sent, str(sent))
+
+
+def test_payload_sqlite_records_ws_rounds():
+    base = load_config(ROOT / "config.toml")
+    if not hasattr(base.log, "payload_sqlite_path"):
+        check("payload sqlite config supported", False, "LogCfg.payload_sqlite_path missing")
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "payloads.sqlite3"
+        cfg = replace(base, log=replace(base.log, payload_sqlite_path=str(db_path)))
+        app = create_app(cfg)
+        client_stub = FakeClient([
+            FakeResp(_round("rs_log_a", "ENC_A", 516, msg="trunc")),
+            FakeResp(_round("rs_log_b", "ENC_B", 999, msg="done")),
+        ])
+
+        with TestClient(app) as client:
+            app.state.client = client_stub
+            with client.websocket_connect("/v1/responses") as ws:
+                ws.send_json(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.5",
+                        "previous_response_id": "resp_existing",
+                        "input": [{"role": "user", "content": "log me"}],
+                    }
+                )
+                while True:
+                    ev = ws.receive_json()
+                    if ev.get("type") in ("response.completed", "response.failed", "response.incomplete"):
+                        break
+
+        db = sqlite3.connect(db_path)
+        try:
+            rows = db.execute(
+                "select transport, phase, url, status_code, model, payload_json "
+                "from outbound_payloads order by id"
+            ).fetchall()
+        finally:
+            db.close()
+
+        check("payload sqlite records two ws upstream requests", len(rows) == 2, str(rows))
+        phases = [r[1] for r in rows]
+        check("payload sqlite records first and continuation phases",
+              phases == ["fold_round_1", "continuation"], str(phases))
+        first_payload = json.loads(rows[0][5]) if rows else {}
+        check("payload sqlite stores sanitized outbound body",
+              "previous_response_id" not in first_payload, str(first_payload))
+        check("payload sqlite records status code",
+              rows[0][3] == 200 and rows[1][3] == 200 if rows else False, str(rows))
+
+
+def test_payload_sqlite_initialized_on_startup():
+    base = load_config(ROOT / "config.toml")
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "payloads.sqlite3"
+        cfg = replace(base, log=replace(base.log, payload_sqlite_path=str(db_path)))
+        app = create_app(cfg)
+
+        with TestClient(app):
+            pass
+
+        created_on_startup = db_path.exists()
+        names = []
+        if created_on_startup:
+            db = sqlite3.connect(db_path)
+            try:
+                names = [
+                    row[0]
+                    for row in db.execute(
+                        "select name from sqlite_master where type = 'table' order by name"
+                    ).fetchall()
+                ]
+            finally:
+                db.close()
+
+        check("payload sqlite initializes database on startup", created_on_startup, str(db_path))
+        check("payload sqlite creates outbound_payloads table",
+              "outbound_payloads" in names, str(names))
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -721,6 +829,9 @@ async def _main():
     await test_eof_incomplete()
     test_websocket_route_streams_events()
     test_websocket_warmup_generate_false()
+    test_websocket_strips_previous_response_id_for_codex_backend()
+    test_payload_sqlite_records_ws_rounds()
+    test_payload_sqlite_initialized_on_startup()
 
 
 def main():

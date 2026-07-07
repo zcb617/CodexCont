@@ -50,3 +50,4 @@ rechunk_size = 16
 [log]
 level = "info"
 dump_rounds_dir = ""               # if set, dump per-round upstream SSE (codex_mw_r{n}.sse.txt)
+#payload_sqlite_path = "/data/payloads.sqlite3"             # if set, record outbound upstream payload JSON to this SQLite DB

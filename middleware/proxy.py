@@ -38,6 +38,10 @@ async def open_round(
     url: str,
     payload: dict[str, Any],
     headers: dict[str, str],
+    *,
+    payload_logger: Any | None = None,
+    transport: str = "",
+    phase: str = "",
 ) -> httpx.Response:
     """Open a streaming upstream request (caller must aclose the response).
 
@@ -46,7 +50,16 @@ async def open_round(
     """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = client.build_request("POST", url, content=body, headers=headers, timeout=None)
-    return await client.send(req, stream=True)
+    resp = await client.send(req, stream=True)
+    if payload_logger is not None:
+        payload_logger.record(
+            transport=transport,
+            phase=phase,
+            url=url,
+            payload=payload,
+            status_code=resp.status_code,
+        )
+    return resp
 
 
 async def open_passthrough(
@@ -54,10 +67,27 @@ async def open_passthrough(
     url: str,
     raw_body: bytes,
     headers: dict[str, str],
+    *,
+    payload_logger: Any | None = None,
+    transport: str = "",
+    phase: str = "",
 ) -> httpx.Response:
     """Open a streaming upstream request forwarding the raw body unchanged."""
     req = client.build_request("POST", url, content=raw_body, headers=headers, timeout=None)
-    return await client.send(req, stream=True)
+    resp = await client.send(req, stream=True)
+    if payload_logger is not None:
+        try:
+            payload: Any = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = {"_raw": raw_body.decode("utf-8", errors="replace")}
+        payload_logger.record(
+            transport=transport,
+            phase=phase,
+            url=url,
+            payload=payload,
+            status_code=resp.status_code,
+        )
+    return resp
 
 
 async def _tee(aiter: AsyncIterator[bytes], dump_path: Path) -> AsyncIterator[bytes]:
@@ -294,6 +324,8 @@ async def fold_stream(
     first_response: httpx.Response,
     id_store: Any | None = None,
     url: str | None = None,
+    payload_logger: Any | None = None,
+    transport: str = "",
 ) -> AsyncIterator[bytes]:
     """Yield the folded downstream SSE byte stream. `first_response` is the
     already-opened (2xx) round-1 upstream response; later rounds are opened here
@@ -477,7 +509,15 @@ async def fold_stream(
                     force_include_encrypted=cfg.stream.force_include_encrypted,
                     drop_previous_response_id=True,
                 )
-                response = await open_round(client, url, payload, headers)
+                response = await open_round(
+                    client,
+                    url,
+                    payload,
+                    headers,
+                    payload_logger=payload_logger,
+                    transport=transport,
+                    phase="continuation",
+                )
                 if response.status_code >= 400:
                     body = (await response.aread())[:2000]
                     await response.aclose()

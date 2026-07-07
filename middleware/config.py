@@ -69,6 +69,7 @@ class StreamCfg:
 class LogCfg:
     level: str = "info"
     dump_rounds_dir: str = ""
+    payload_sqlite_path: str = ""
 
 
 @dataclass(frozen=True)

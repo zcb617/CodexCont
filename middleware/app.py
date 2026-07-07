@@ -12,6 +12,7 @@ import logging
 import time
 import uuid
 from typing import Any, AsyncIterator, Iterable
+from urllib.parse import urlparse
 
 import httpx
 from starlette.applications import Starlette
@@ -28,6 +29,7 @@ from .codex import (
 )
 from .config import Config
 from .creds import build_upstream_headers, would_inject_authorization
+from .payload_log import SQLitePayloadLogger
 from .proxy import fold_stream, open_passthrough, open_round
 from .sse import DONE, incremental_sse
 from .store import IdStore
@@ -73,6 +75,24 @@ def _resolve_upstream_url(cfg: Config, request: Request) -> str | None:
 
 def _url_is_from_header(cfg: Config, request: Request) -> bool:
     return cfg.upstream.mode in ("header", "header_required") and _header_base(request) is not None
+
+
+def _is_chatgpt_codex_responses_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/")
+    return host == "chatgpt.com" and path.endswith("/backend-api/codex/responses")
+
+
+def _body_for_upstream(body: dict[str, Any], url: str) -> dict[str, Any]:
+    if "previous_response_id" not in body or not _is_chatgpt_codex_responses_url(url):
+        return body
+    out = dict(body)
+    out.pop("previous_response_id", None)
+    return out
 
 
 def _collision(cfg: Config, body: dict[str, Any]) -> bool:
@@ -242,11 +262,24 @@ def _merge_warmup_body(warmup: dict[str, Any], current: dict[str, Any]) -> dict[
 
 
 async def _passthrough(
-    client: httpx.AsyncClient, cfg: Config, request: Request, raw: bytes, url: str
+    client: httpx.AsyncClient,
+    cfg: Config,
+    request: Request,
+    raw: bytes,
+    url: str,
+    payload_logger: Any | None = None,
 ):
     """Pure proxy: forward the raw request and stream the raw response back."""
     headers = build_upstream_headers(request.headers.items(), cfg)
-    resp = await open_passthrough(client, url, raw, headers)
+    resp = await open_passthrough(
+        client,
+        url,
+        raw,
+        headers,
+        payload_logger=payload_logger,
+        transport="http",
+        phase="passthrough",
+    )
 
     async def body_iter():
         try:
@@ -265,6 +298,7 @@ async def _passthrough(
 async def handle_responses(request: Request) -> Response:
     cfg: Config = request.app.state.cfg
     client: httpx.AsyncClient = request.app.state.client
+    payload_logger = getattr(request.app.state, "payload_logger", None)
 
     raw = await request.body()
     try:
@@ -292,7 +326,9 @@ async def handle_responses(request: Request) -> Response:
         why = _passthrough_reason(cfg, body)
         log.info("passthrough (%s): model=%s path=%s url=%s",
                  why, body.get("model"), request.url.path, url)
-        return await _passthrough(client, cfg, request, raw, url)
+        upstream_body = _body_for_upstream(body, url)
+        upstream_raw = _json_body_bytes(upstream_body) if upstream_body is not body else raw
+        return await _passthrough(client, cfg, request, upstream_raw, url, payload_logger)
 
     log.info("fold start: model=%s path=%s url=%s input_items=%d",
              body.get("model"), request.url.path, url, len(body.get("input") or []))
@@ -311,16 +347,25 @@ async def handle_responses(request: Request) -> Response:
         }
 
     headers = build_upstream_headers(request.headers.items(), cfg)
+    upstream_body = _body_for_upstream(body, url)
     payload = build_round_payload(
-        body,
-        input_items=list(body.get("input") or []),
+        upstream_body,
+        input_items=list(upstream_body.get("input") or []),
         force_include_encrypted=cfg.stream.force_include_encrypted,
-        drop_previous_response_id=False,  # round 1 passes it through
+        drop_previous_response_id=False,  # round 1 uses the already sanitized body
     )
 
     # Open round 1 here so a non-2xx (e.g. bad auth) is mirrored with its real
     # status code rather than buried inside a 200 SSE stream.
-    resp = await open_round(client, url, payload, headers)
+    resp = await open_round(
+        client,
+        url,
+        payload,
+        headers,
+        payload_logger=payload_logger,
+        transport="http",
+        phase="fold_round_1",
+    )
     if resp.status_code >= 400:
         err = await resp.aread()
         await resp.aclose()
@@ -329,7 +374,17 @@ async def handle_responses(request: Request) -> Response:
         )
 
     return StreamingResponse(
-        fold_stream(client, cfg, body, headers, resp, request.app.state.id_store, url=url),
+        fold_stream(
+            client,
+            cfg,
+            upstream_body,
+            headers,
+            resp,
+            request.app.state.id_store,
+            url=url,
+            payload_logger=payload_logger,
+            transport="http",
+        ),
         media_type="text/event-stream",
     )
 
@@ -338,6 +393,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     cfg: Config = websocket.app.state.cfg
     client: httpx.AsyncClient = websocket.app.state.client
+    payload_logger = getattr(websocket.app.state, "payload_logger", None)
     warmups: dict[str, dict[str, Any]] = {}
 
     while True:
@@ -387,7 +443,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
             continue
 
         headers = _ws_upstream_headers(websocket.headers.items(), cfg)
-        should_fold = (not warmup) and _should_fold(cfg, body)
+        upstream_body = _body_for_upstream(body, url)
+        should_fold = (not warmup) and _should_fold(cfg, upstream_body)
 
         if warmup:
             log.info("warmup(ws): model=%s path=%s url=%s input_items=%d local_state=1",
@@ -399,19 +456,36 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
             continue
         elif should_fold:
             log.info("fold start(ws): model=%s path=%s url=%s input_items=%d",
-                     body.get("model"), websocket.url.path, url, len(body.get("input") or []))
+                     upstream_body.get("model"), websocket.url.path, url,
+                     len(upstream_body.get("input") or []))
             payload = build_round_payload(
-                body,
-                input_items=list(body.get("input") or []),
+                upstream_body,
+                input_items=list(upstream_body.get("input") or []),
                 force_include_encrypted=cfg.stream.force_include_encrypted,
                 drop_previous_response_id=False,
             )
-            resp = await open_round(client, url, payload, headers)
+            resp = await open_round(
+                client,
+                url,
+                payload,
+                headers,
+                payload_logger=payload_logger,
+                transport="ws",
+                phase="fold_round_1",
+            )
         else:
             why = _passthrough_reason(cfg, body)
             log.info("passthrough(ws) (%s): model=%s path=%s url=%s",
                      why, body.get("model"), websocket.url.path, url)
-            resp = await open_passthrough(client, url, _json_body_bytes(body), headers)
+            resp = await open_passthrough(
+                client,
+                url,
+                _json_body_bytes(upstream_body),
+                headers,
+                payload_logger=payload_logger,
+                transport="ws",
+                phase="passthrough",
+            )
 
         if resp.status_code >= 400:
             err = await resp.aread()
@@ -425,11 +499,13 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                     fold_stream(
                         client,
                         cfg,
-                        body,
+                        upstream_body,
                         headers,
                         resp,
                         websocket.app.state.id_store,
                         url=url,
+                        payload_logger=payload_logger,
+                        transport="ws",
                     )
                 )
                 async for ev in event_iter:
@@ -461,6 +537,11 @@ def create_app(cfg: Config) -> Starlette:
         app.state.cfg = cfg
         app.state.client = _make_client()
         app.state.id_store = IdStore()
+        app.state.payload_logger = SQLitePayloadLogger.from_config(cfg)
+        if app.state.payload_logger is not None:
+            app.state.payload_logger.initialize()
+        else:
+            log.info("outbound payload sqlite logging disabled")
         try:
             yield
         finally:
