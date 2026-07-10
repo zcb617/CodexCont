@@ -261,6 +261,41 @@ def _merge_warmup_body(warmup: dict[str, Any], current: dict[str, Any]) -> dict[
     return merged
 
 
+def _merge_previous_response_body(
+    contexts: dict[str, list[Any]],
+    current: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    prev_id = current.get("previous_response_id")
+    if not isinstance(prev_id, str) or prev_id not in contexts:
+        return current, None
+
+    merged = dict(current)
+    merged["input"] = contexts[prev_id] + list(current.get("input") or [])
+    merged.pop("previous_response_id", None)
+    return merged, prev_id
+
+
+def _remember_response_context(
+    contexts: dict[str, list[Any]],
+    response: Any,
+    request_input: list[Any],
+    consumed_prev_id: str | None,
+) -> None:
+    if not isinstance(response, dict):
+        return
+    response_id = response.get("id")
+    output = response.get("output")
+    if not isinstance(response_id, str) or not isinstance(output, list):
+        return
+
+    contexts[response_id] = request_input + output
+    if consumed_prev_id is not None and consumed_prev_id != response_id:
+        contexts.pop(consumed_prev_id, None)
+
+    while len(contexts) > 16:
+        contexts.pop(next(iter(contexts)))
+
+
 async def _passthrough(
     client: httpx.AsyncClient,
     cfg: Config,
@@ -395,6 +430,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     client: httpx.AsyncClient = websocket.app.state.client
     payload_logger = getattr(websocket.app.state, "payload_logger", None)
     warmups: dict[str, dict[str, Any]] = {}
+    response_contexts: dict[str, list[Any]] = {}
 
     while True:
         try:
@@ -424,11 +460,16 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         body = {k: v for k, v in msg.items() if k != "type"}
         body.pop("background", None)
         warmup = _is_ws_warmup(body)
+        consumed_prev_id: str | None = None
         if not warmup:
             body["stream"] = True
             prev_id = body.get("previous_response_id")
             if isinstance(prev_id, str) and prev_id in warmups:
                 body = _merge_warmup_body(warmups.pop(prev_id), body)
+            else:
+                body, consumed_prev_id = _merge_previous_response_body(
+                    response_contexts, body
+                )
 
         url = _resolve_upstream_url(cfg, websocket)
         if url is None:
@@ -444,6 +485,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
 
         headers = _ws_upstream_headers(websocket.headers.items(), cfg)
         upstream_body = _body_for_upstream(body, url)
+        request_input = list(upstream_body.get("input") or [])
         should_fold = (not warmup) and _should_fold(cfg, upstream_body)
 
         if warmup:
@@ -509,10 +551,32 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                     )
                 )
                 async for ev in event_iter:
+                    if ev.get("type") in (
+                        "response.completed",
+                        "response.failed",
+                        "response.incomplete",
+                    ):
+                        _remember_response_context(
+                            response_contexts,
+                            ev.get("response"),
+                            request_input,
+                            consumed_prev_id,
+                        )
                     await websocket.send_json(ev)
             else:
                 try:
                     async for ev in _iter_sse_events(resp.aiter_bytes()):
+                        if ev.get("type") in (
+                            "response.completed",
+                            "response.failed",
+                            "response.incomplete",
+                        ):
+                            _remember_response_context(
+                                response_contexts,
+                                ev.get("response"),
+                                request_input,
+                                consumed_prev_id,
+                            )
                         await websocket.send_json(ev)
                 finally:
                     await resp.aclose()

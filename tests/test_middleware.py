@@ -21,7 +21,12 @@ sys.path.insert(0, str(ROOT))
 from starlette.datastructures import Headers
 from starlette.testclient import TestClient
 
-from middleware.app import create_app, _make_client, _resolve_upstream_url, _url_is_from_header
+from middleware.app import (
+    create_app,
+    _make_client,
+    _resolve_upstream_url,
+    _url_is_from_header,
+)
 from middleware.codex import (
     continue_call_id,
     is_truncation_pattern,
@@ -729,6 +734,176 @@ def test_websocket_strips_previous_response_id_for_codex_backend():
           "previous_response_id" not in sent, str(sent))
 
 
+def test_websocket_replays_previous_tool_call_for_output():
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    tool = {
+        "id": "fc_replay",
+        "type": "function_call",
+        "name": "shell",
+        "call_id": "call_replay",
+        "arguments": "{\"cmd\":\"pwd\"}",
+    }
+    client_stub = FakeClient([
+        FakeResp(_round("rs_replay", "ENC_REPLAY", 999, extra_items=[tool])),
+        FakeResp(_round("rs_done", "ENC_DONE", 999, msg="done")),
+    ])
+
+    with TestClient(app) as client:
+        app.state.client = client_stub
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "input": [{"role": "user", "content": "run pwd"}],
+                }
+            )
+            response_id = None
+            while True:
+                ev = ws.receive_json()
+                if ev.get("type") in (
+                    "response.completed",
+                    "response.failed",
+                    "response.incomplete",
+                ):
+                    response_id = (ev.get("response") or {}).get("id")
+                    break
+
+            ws.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "previous_response_id": response_id,
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_replay",
+                            "output": "/app",
+                        }
+                    ],
+                }
+            )
+            while True:
+                ev = ws.receive_json()
+                if ev.get("type") in (
+                    "response.completed",
+                    "response.failed",
+                    "response.incomplete",
+                ):
+                    break
+
+    replayed = client_stub.payloads[1] if len(client_stub.payloads) > 1 else {}
+    replayed_input = replayed.get("input") or []
+    replayed_types = [
+        item.get("type") for item in replayed_input if isinstance(item, dict)
+    ]
+    check("tool output replay strips unsupported previous_response_id",
+          "previous_response_id" not in replayed, str(replayed))
+    check("tool output replay includes matching function_call",
+          "function_call" in replayed_types, str(replayed_types))
+    check("tool output replay keeps function_call_output",
+          replayed_types[-1:] == ["function_call_output"], str(replayed_types))
+    call_ids = [
+        item.get("call_id")
+        for item in replayed_input
+        if isinstance(item, dict) and item.get("type") in (
+            "function_call", "function_call_output"
+        )
+    ]
+    check("tool output replay call ids match",
+          call_ids == ["call_replay", "call_replay"], str(call_ids))
+
+
+def test_websocket_response_contexts_are_connection_local():
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    tool_a = {
+        "id": "fc_a",
+        "type": "function_call",
+        "name": "shell",
+        "call_id": "call_connection_a",
+        "arguments": "{}",
+    }
+    tool_b = {
+        "id": "fc_b",
+        "type": "function_call",
+        "name": "shell",
+        "call_id": "call_connection_b",
+        "arguments": "{}",
+    }
+    client_stub = FakeClient([
+        FakeResp(_round("rs_a", "ENC_A", 999, extra_items=[tool_a])),
+        FakeResp(_round("rs_b", "ENC_B", 999, extra_items=[tool_b])),
+        FakeResp(_round("rs_done_a", "ENC_DONE_A", 999, msg="a done")),
+        FakeResp(_round("rs_done_b", "ENC_DONE_B", 999, msg="b done")),
+    ])
+
+    def receive_terminal(ws):
+        while True:
+            ev = ws.receive_json()
+            if ev.get("type") in (
+                "response.completed",
+                "response.failed",
+                "response.incomplete",
+            ):
+                return (ev.get("response") or {}).get("id")
+
+    with TestClient(app) as client:
+        app.state.client = client_stub
+        with client.websocket_connect("/v1/responses") as ws_a:
+            with client.websocket_connect("/v1/responses") as ws_b:
+                ws_a.send_json({
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "input": [{"role": "user", "content": "connection a"}],
+                })
+                response_a = receive_terminal(ws_a)
+                ws_b.send_json({
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "input": [{"role": "user", "content": "connection b"}],
+                })
+                response_b = receive_terminal(ws_b)
+
+                ws_a.send_json({
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "previous_response_id": response_a,
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": "call_connection_a",
+                        "output": "a",
+                    }],
+                })
+                receive_terminal(ws_a)
+                ws_b.send_json({
+                    "type": "response.create",
+                    "model": "gpt-5.5",
+                    "previous_response_id": response_b,
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": "call_connection_b",
+                        "output": "b",
+                    }],
+                })
+                receive_terminal(ws_b)
+
+    def replayed_call_ids(payload):
+        return [
+            item.get("call_id")
+            for item in payload.get("input") or []
+            if isinstance(item, dict) and item.get("type") == "function_call"
+        ]
+
+    payload_a = client_stub.payloads[2] if len(client_stub.payloads) > 2 else {}
+    payload_b = client_stub.payloads[3] if len(client_stub.payloads) > 3 else {}
+    check("connection a replays only its own function call",
+          replayed_call_ids(payload_a) == ["call_connection_a"], str(payload_a))
+    check("connection b replays only its own function call",
+          replayed_call_ids(payload_b) == ["call_connection_b"], str(payload_b))
+
+
 def test_payload_sqlite_records_ws_rounds():
     base = load_config(ROOT / "config.toml")
     if not hasattr(base.log, "payload_sqlite_path"):
@@ -830,6 +1005,8 @@ async def _main():
     test_websocket_route_streams_events()
     test_websocket_warmup_generate_false()
     test_websocket_strips_previous_response_id_for_codex_backend()
+    test_websocket_replays_previous_tool_call_for_output()
+    test_websocket_response_contexts_are_connection_local()
     test_payload_sqlite_records_ws_rounds()
     test_payload_sqlite_initialized_on_startup()
 
