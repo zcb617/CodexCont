@@ -41,6 +41,10 @@ from .proxy import (
 )
 from .sse import DONE, incremental_sse
 from .store import IdStore
+from .ws_upstream import (
+    connect_upstream_websocket,
+    upstream_websocket_error_status,
+)
 
 log = logging.getLogger("middleware.app")
 
@@ -158,15 +162,8 @@ def _json_body_bytes(body: dict[str, Any]) -> bytes:
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
-def _ensure_header(headers: dict[str, str], name: str, value: str) -> None:
-    if not any(k.lower() == name.lower() for k in headers):
-        headers[name] = value
-
-
 def _ws_upstream_headers(headers: Iterable[tuple[str, str]], cfg: Config) -> dict[str, str]:
-    out = build_upstream_headers(headers, cfg)
-    _ensure_header(out, "Content-Type", "application/json")
-    return out
+    return build_upstream_headers(headers, cfg)
 
 
 def _ws_error_event(
@@ -199,56 +196,6 @@ def _upstream_error_event(raw: bytes, status: int) -> dict[str, Any]:
 
 def _is_ws_warmup(body: dict[str, Any]) -> bool:
     return body.get("generate") is False
-
-
-async def _open_json_request(
-    client: httpx.AsyncClient,
-    url: str,
-    body: dict[str, Any],
-    headers: dict[str, str],
-) -> httpx.Response:
-    req = client.build_request(
-        "POST",
-        url,
-        content=_json_body_bytes(body),
-        headers=headers,
-        timeout=None,
-    )
-    return await client.send(req, stream=False)
-
-
-def _terminal_type_for_response(resp: dict[str, Any]) -> str:
-    status = resp.get("status")
-    if status == "failed":
-        return "response.failed"
-    if status == "incomplete":
-        return "response.incomplete"
-    return "response.completed"
-
-
-def _warmup_events_from_response(resp: dict[str, Any]) -> list[dict[str, Any]]:
-    response = dict(resp)
-    response.setdefault("status", "completed")
-    return [
-        {"type": "response.created", "response": response, "sequence_number": 0},
-        {"type": _terminal_type_for_response(response), "response": response, "sequence_number": 1},
-    ]
-
-
-def _local_warmup_response(body: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": f"resp_warmup_{uuid.uuid4().hex}",
-        "object": "response",
-        "created_at": int(time.time()),
-        "status": "completed",
-        "model": body.get("model"),
-        "output": [],
-        "usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-        },
-    }
 
 
 def _merge_warmup_body(warmup: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
@@ -486,15 +433,24 @@ async def _receive_ws_json(inbox: asyncio.Queue[dict[str, Any]]) -> Any:
 
 async def _close_active_ws_response(activity: dict[str, Any]) -> None:
     response = activity.pop("response", None)
-    if response is None:
-        return
-    try:
-        await response.aclose()
-    except Exception as exc:
-        log.warning(
-            "event=upstream_response_close_exception trace_id=%s error_type=%s error=%r",
-            activity.get("trace_id") or "-", type(exc).__name__, exc,
-        )
+    if response is not None:
+        try:
+            await response.aclose()
+        except Exception as exc:
+            log.warning(
+                "event=upstream_response_close_exception trace_id=%s error_type=%s error=%r",
+                activity.get("trace_id") or "-", type(exc).__name__, exc,
+            )
+
+    session = activity.pop("upstream_session", None)
+    if session is not None:
+        try:
+            await session.aclose()
+        except Exception as exc:
+            log.warning(
+                "event=upstream_ws_close_exception trace_id=%s error_type=%s error=%r",
+                activity.get("trace_id") or "-", type(exc).__name__, exc,
+            )
 
 
 async def handle_responses_ws(websocket: WebSocket) -> None:
@@ -505,6 +461,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         "trace_id": None,
         "request_started": None,
         "response": None,
+        "upstream_session": None,
     }
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     log.info(
@@ -645,56 +602,79 @@ async def _process_responses_ws(
             continue
 
         headers = _ws_upstream_headers(websocket.headers.items(), cfg)
-        upstream_body = _body_for_upstream(body, url)
+        upstream_body = body
         request_input = list(upstream_body.get("input") or [])
         should_fold = (not warmup) and _should_fold(cfg, upstream_body)
 
-        if warmup:
-            log.info("warmup(ws): model=%s path=%s url=%s input_items=%d local_state=1",
-                     body.get("model"), websocket.url.path, url, len(body.get("input") or []))
-            resp_obj = _local_warmup_response(body)
-            warmups[resp_obj["id"]] = dict(body)
-            for ev in _warmup_events_from_response(resp_obj):
-                await websocket.send_json(ev)
+        activity["trace_id"] = trace_id
+        activity["request_started"] = request_started
+        try:
+            upstream_session = activity.get("upstream_session")
+            if upstream_session is None:
+                connector = websocket.app.state.ws_connector
+                upstream_session = await connector(
+                    url=url,
+                    headers=headers,
+                    payload_logger=payload_logger,
+                    connection_id=connection_id,
+                )
+                activity["upstream_session"] = upstream_session
+
+            if warmup:
+                log.info(
+                    "warmup(ws): trace_id=%s model=%s path=%s url=%s input_items=%d",
+                    trace_id, body.get("model"), websocket.url.path, url,
+                    len(body.get("input") or []),
+                )
+                resp = await upstream_session.open_round(
+                    upstream_body,
+                    phase="warmup",
+                    trace_id=trace_id,
+                )
+            elif should_fold:
+                log.info("fold start(ws): trace_id=%s model=%s path=%s url=%s input_items=%d",
+                         trace_id, upstream_body.get("model"), websocket.url.path, url,
+                         len(upstream_body.get("input") or []))
+                payload = build_round_payload(
+                    upstream_body,
+                    input_items=list(upstream_body.get("input") or []),
+                    force_include_encrypted=cfg.stream.force_include_encrypted,
+                    drop_previous_response_id=False,
+                )
+                resp = await upstream_session.open_round(
+                    payload,
+                    phase="fold_round_1",
+                    trace_id=trace_id,
+                )
+            else:
+                why = _passthrough_reason(cfg, body)
+                log.info("passthrough(ws) (%s): model=%s path=%s url=%s",
+                         why, body.get("model"), websocket.url.path, url)
+                resp = await upstream_session.open_round(
+                    upstream_body,
+                    phase="passthrough",
+                    trace_id=trace_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except ConnectionError as exc:
+            status = upstream_websocket_error_status(exc)
+            log.warning(
+                "event=downstream_error_send trace_id=%s connection_id=%s "
+                "transport=ws status=%s error_type=%s error=%r",
+                trace_id, connection_id, status, type(exc).__name__, exc,
+            )
+            await _close_active_ws_response(activity)
+            await websocket.send_json(
+                _ws_error_event(
+                    "Upstream WebSocket connection failed.",
+                    status=status,
+                    code="upstream_connection_error",
+                )
+            )
+            activity["trace_id"] = None
+            activity["request_started"] = None
             continue
-        elif should_fold:
-            activity["trace_id"] = trace_id
-            activity["request_started"] = request_started
-            log.info("fold start(ws): trace_id=%s model=%s path=%s url=%s input_items=%d",
-                     trace_id, upstream_body.get("model"), websocket.url.path, url,
-                     len(upstream_body.get("input") or []))
-            payload = build_round_payload(
-                upstream_body,
-                input_items=list(upstream_body.get("input") or []),
-                force_include_encrypted=cfg.stream.force_include_encrypted,
-                drop_previous_response_id=False,
-            )
-            resp = await open_round(
-                client,
-                url,
-                payload,
-                headers,
-                payload_logger=payload_logger,
-                transport="ws",
-                phase="fold_round_1",
-                trace_id=trace_id,
-            )
-        else:
-            activity["trace_id"] = trace_id
-            activity["request_started"] = request_started
-            why = _passthrough_reason(cfg, body)
-            log.info("passthrough(ws) (%s): model=%s path=%s url=%s",
-                     why, body.get("model"), websocket.url.path, url)
-            resp = await open_passthrough(
-                client,
-                url,
-                _json_body_bytes(upstream_body),
-                headers,
-                payload_logger=payload_logger,
-                transport="ws",
-                phase="passthrough",
-                trace_id=trace_id,
-            )
 
         activity["response"] = resp
 
@@ -727,6 +707,7 @@ async def _process_responses_ws(
                         payload_logger=payload_logger,
                         transport="ws",
                         trace_id=trace_id,
+                        round_opener=upstream_session.open_round,
                     )
                 )
                 async for ev in event_iter:
@@ -744,7 +725,15 @@ async def _process_responses_ws(
                     await websocket.send_json(ev)
             else:
                 try:
-                    async for ev in _iter_sse_events(observed_response_bytes(resp)):
+                    async for ev in resp.aiter_events():
+                        if warmup and ev.get("type") in (
+                            "response.completed",
+                            "response.failed",
+                            "response.incomplete",
+                        ):
+                            warmup_id = (ev.get("response") or {}).get("id")
+                            if isinstance(warmup_id, str):
+                                warmups[warmup_id] = dict(body)
                         if ev.get("type") in (
                             "response.completed",
                             "response.failed",
@@ -768,6 +757,21 @@ async def _process_responses_ws(
                 (time.perf_counter() - request_started) * 1000,
             )
             return
+        except ConnectionError as exc:
+            status = upstream_websocket_error_status(exc)
+            log.warning(
+                "event=upstream_ws_stream_exception trace_id=%s connection_id=%s "
+                "status=%s error_type=%s error=%r",
+                trace_id, connection_id, status, type(exc).__name__, exc,
+            )
+            await _close_active_ws_response(activity)
+            await websocket.send_json(
+                _ws_error_event(
+                    "Upstream WebSocket stream failed.",
+                    status=status,
+                    code="upstream_connection_error",
+                )
+            )
         else:
             log.info(
                 "event=downstream_request_end trace_id=%s transport=ws outcome=stream_end "
@@ -795,6 +799,7 @@ def create_app(cfg: Config) -> Starlette:
     async def lifespan(app: Starlette):
         app.state.cfg = cfg
         app.state.client = _make_client()
+        app.state.ws_connector = connect_upstream_websocket
         app.state.id_store = IdStore()
         app.state.payload_logger = SQLitePayloadLogger.from_config(cfg)
         if app.state.payload_logger is not None:

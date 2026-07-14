@@ -48,7 +48,7 @@ uv run python run.py
 
 `run.py` reads the local `config.toml`; start by copying `config.example.toml` and then adjust it as needed.
 
-The example default server listens on `127.0.0.1:8787` and accepts POST requests at:
+The example default server listens on `127.0.0.1:8787` and accepts both HTTP POST and WebSocket connections at:
 
 - `/v1/responses`
 
@@ -86,6 +86,14 @@ Responses-API-Base: https://api.openai.com/v1
 ```
 
 The middleware appends `/responses` unless the supplied value already ends with `/responses`. This control header is stripped before forwarding upstream.
+
+## Transport mapping
+
+The proxy no longer converts a downstream WebSocket request into an upstream HTTP request:
+
+- HTTP downstream connections use HTTP POST upstream.
+- WebSocket downstream connections use native WebSocket upstream; configured `https://` / `http://` URLs map to `wss://` / `ws://` respectively.
+- Each downstream WebSocket owns one upstream WebSocket. Sequential `response.create` requests and proxy-generated hidden continuation rounds reuse that same upstream connection.
 
 ## Authentication
 
@@ -165,6 +173,8 @@ Current offline coverage includes:
 - upstream URL resolution
 - auth safety guard
 - EOF/upstream-error behavior
+- HTTP/HTTP and WebSocket/WebSocket transport mapping
+- multi-round upstream WebSocket reuse and downstream-disconnect cancellation
 
 ## Project layout
 

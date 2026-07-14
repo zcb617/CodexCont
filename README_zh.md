@@ -46,7 +46,7 @@ uv run python run.py
 
 `run.py` 会读取本地 `config.toml`；请先从 `config.example.toml` 复制一份，再按需调整。
 
-示例默认服务监听 `127.0.0.1:8787`，接受以下路径的 POST 请求：
+示例默认服务监听 `127.0.0.1:8787`，在以下路径同时接受 HTTP POST 和 WebSocket 连接：
 
 - `/v1/responses`
 
@@ -84,6 +84,14 @@ Responses-API-Base: https://api.openai.com/v1
 ```
 
 中间件会自动追加 `/responses`；如果传入值已经以 `/responses` 结尾，则保持不变。该控制头不会被继续转发到上游。
+
+## 传输协议映射
+
+代理不会再把下游 WebSocket 请求转换成上游 HTTP 请求：
+
+- 下游使用 HTTP 时，上游使用 HTTP POST。
+- 下游使用 WebSocket 时，上游使用原生 WebSocket；配置中的 `https://` / `http://` 上游地址会分别映射为 `wss://` / `ws://`。
+- 一条下游 WebSocket 对应一条上游 WebSocket。多轮 `response.create` 以及代理触发的隐藏续写轮次，都会在这条上游连接上按顺序发送。
 
 ## 鉴权
 
@@ -163,6 +171,8 @@ uv run python tests/test_middleware.py
 - 上游 URL 解析
 - 鉴权安全保护
 - EOF / 上游错误处理
+- HTTP/HTTP 与 WebSocket/WebSocket 传输映射
+- 同一上游 WebSocket 的多轮复用和下游断连取消
 
 ## 项目结构
 

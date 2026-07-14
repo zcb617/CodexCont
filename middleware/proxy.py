@@ -13,7 +13,7 @@ import json
 import logging
 from pathlib import Path
 import time
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 import uuid
 
 import httpx
@@ -513,12 +513,13 @@ async def fold_stream(
     cfg: Config,
     base_body: dict[str, Any],
     headers: dict[str, str],
-    first_response: httpx.Response,
+    first_response: Any,
     id_store: Any | None = None,
     url: str | None = None,
     payload_logger: Any | None = None,
     transport: str = "",
     trace_id: str = "",
+    round_opener: Callable[..., Awaitable[Any]] | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield the folded downstream SSE byte stream. `first_response` is the
     already-opened (2xx) round-1 upstream response; later rounds are opened here
@@ -702,16 +703,23 @@ async def fold_stream(
                     force_include_encrypted=cfg.stream.force_include_encrypted,
                     drop_previous_response_id=True,
                 )
-                response = await open_round(
-                    client,
-                    url,
-                    payload,
-                    headers,
-                    payload_logger=payload_logger,
-                    transport=transport,
-                    phase="continuation",
-                    trace_id=trace_id,
-                )
+                if round_opener is not None:
+                    response = await round_opener(
+                        payload,
+                        phase="continuation",
+                        trace_id=trace_id,
+                    )
+                else:
+                    response = await open_round(
+                        client,
+                        url,
+                        payload,
+                        headers,
+                        payload_logger=payload_logger,
+                        transport=transport,
+                        phase="continuation",
+                        trace_id=trace_id,
+                    )
                 if response.status_code >= 400:
                     body = (await read_upstream_error(response))[:2000]
                     await response.aclose()

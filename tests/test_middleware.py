@@ -44,6 +44,12 @@ from middleware import proxy as proxy_module
 from middleware.proxy import fold_stream, open_round, read_upstream_error
 from middleware.sse import DONE, incremental_sse
 from middleware.store import IdStore
+from middleware.ws_upstream import (
+    UpstreamWebSocketError,
+    connect_upstream_websocket,
+    response_create_payload,
+    to_websocket_url,
+)
 
 
 # --- helpers ----------------------------------------------------------------
@@ -79,6 +85,11 @@ class FakeResp:
         for i in range(0, len(self._data), self._chunk):
             yield self._data[i : i + self._chunk]
 
+    async def aiter_events(self):
+        async for event in incremental_sse(self.aiter_bytes()):
+            if event is not DONE and isinstance(event, dict):
+                yield event
+
     async def aread(self) -> bytes:
         return self._data
 
@@ -113,23 +124,79 @@ class FakeClient:
         pass
 
 
-class BlockingClient:
-    """An upstream client that only finishes when its send task is cancelled."""
+class FakeWsSession:
+    def __init__(self, owner, *, url, payload_logger):
+        self.owner = owner
+        self.url = to_websocket_url(url)
+        self.payload_logger = payload_logger
+        self.closed = False
 
+    async def open_round(self, payload, *, phase, trace_id):
+        wire_payload = response_create_payload(payload)
+        self.owner.payloads.append(wire_payload)
+        self.owner.phases.append(phase)
+        response = self.owner.responses[self.owner.response_index]
+        self.owner.response_index += 1
+        if self.payload_logger is not None:
+            self.payload_logger.record(
+                transport="ws",
+                phase=phase,
+                url=self.url,
+                payload=wire_payload,
+                status_code=response.status_code,
+            )
+        return response
+
+    async def aclose(self):
+        self.closed = True
+
+
+class FakeWsConnector:
+    """Creates one fake upstream session per downstream WS connection."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.response_index = 0
+        self.payloads: list[dict] = []
+        self.phases: list[str] = []
+        self.calls: list[dict] = []
+        self.sessions: list[FakeWsSession] = []
+
+    async def __call__(self, *, url, headers, payload_logger, connection_id):
+        self.calls.append({
+            "url": url,
+            "headers": dict(headers),
+            "connection_id": connection_id,
+        })
+        session = FakeWsSession(self, url=url, payload_logger=payload_logger)
+        self.sessions.append(session)
+        return session
+
+
+class BlockingWsSession:
     def __init__(self):
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
+        self.closed = asyncio.Event()
 
-    def build_request(self, *a, **k):
-        return ("blocking-req", a, k)
-
-    async def send(self, req, stream=True):
+    async def open_round(self, payload, *, phase, trace_id):
         self.started.set()
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
             self.cancelled.set()
             raise
+
+    async def aclose(self):
+        self.closed.set()
+
+
+class BlockingWsConnector:
+    def __init__(self):
+        self.session = BlockingWsSession()
+
+    async def __call__(self, **kwargs):
+        return self.session
 
 
 class FakeDownstreamWebSocket:
@@ -696,13 +763,177 @@ async def test_eof_incomplete():
           str([it.get("type") for it in out_items]))
 
 
+async def test_native_upstream_websocket_reuses_connection():
+    captured: dict = {}
+
+    class NativeConnection:
+        def __init__(self):
+            self.sent: list[str] = []
+            self.closed = False
+            self.response = SimpleNamespace(status_code=101, headers={"cf-ray": "test-ray"})
+            self.incoming = [
+                json.dumps({
+                    "type": "response.created",
+                    "response": {"id": "resp_one", "status": "in_progress"},
+                }),
+                json.dumps({
+                    "type": "response.completed",
+                    "response": {"id": "resp_one", "status": "completed", "output": []},
+                }),
+                json.dumps({
+                    "type": "response.created",
+                    "response": {"id": "resp_two", "status": "in_progress"},
+                }),
+                json.dumps({
+                    "type": "response.completed",
+                    "response": {"id": "resp_two", "status": "completed", "output": []},
+                }),
+            ]
+
+        async def send(self, data):
+            self.sent.append(data)
+
+        async def recv(self):
+            return self.incoming.pop(0)
+
+        async def close(self):
+            self.closed = True
+
+    native = NativeConnection()
+
+    async def fake_connect(uri, **kwargs):
+        captured["uri"] = uri
+        captured["kwargs"] = kwargs
+        return native
+
+    session = await connect_upstream_websocket(
+        url="https://chatgpt.com/backend-api/codex/responses?test=1",
+        headers={
+            "Authorization": "Bearer test",
+            "User-Agent": "codex-test",
+            "OpenAI-Beta": "another_feature=v1",
+        },
+        payload_logger=None,
+        connection_id="ws_test",
+        connector=fake_connect,
+    )
+    first = await session.open_round(
+        {"model": "gpt-test", "stream": True, "input": [{"role": "user"}]},
+        phase="fold_round_1",
+        trace_id="trace_one",
+    )
+    first_events = [event async for event in first.aiter_events()]
+    await first.aclose()
+    second = await session.open_round(
+        {
+            "model": "gpt-test",
+            "stream": True,
+            "background": False,
+            "previous_response_id": "resp_one",
+            "input": [{"role": "user"}],
+        },
+        phase="passthrough",
+        trace_id="trace_two",
+    )
+    second_events = [event async for event in second.aiter_events()]
+    await second.aclose()
+    await session.aclose()
+
+    sent = [json.loads(raw) for raw in native.sent]
+    beta = captured.get("kwargs", {}).get("additional_headers", {}).get("OpenAI-Beta", "")
+    check("http upstream URL maps to wss for ws downstream",
+          captured.get("uri") == "wss://chatgpt.com/backend-api/codex/responses?test=1",
+          str(captured.get("uri")))
+    check("native ws handshake includes required beta",
+          "responses_websockets=2026-02-06" in beta, beta)
+    check("native ws handshake preserves existing beta",
+          "another_feature=v1" in beta, beta)
+    check("native ws forwards user agent without duplicate header",
+          captured.get("kwargs", {}).get("user_agent_header") == "codex-test"
+          and not any(
+              key.lower() == "user-agent"
+              for key in captured.get("kwargs", {}).get("additional_headers", {})
+          ),
+          str(captured.get("kwargs")))
+    check("native ws reuses one connection for two rounds",
+          len(sent) == 2 and len(first_events) == 2 and len(second_events) == 2,
+          str(sent))
+    check("native ws sends response.create without HTTP-only fields",
+          all(item.get("type") == "response.create" for item in sent)
+          and all("stream" not in item and "background" not in item for item in sent),
+          str(sent))
+    check("native ws preserves previous_response_id on later round",
+          sent[1].get("previous_response_id") == "resp_one", str(sent[1]))
+    check("native ws session closes its upstream connection", native.closed)
+
+
+def test_http_downstream_keeps_http_upstream():
+    base = load_config(ROOT / "config.toml")
+    cfg = replace(base, cont=replace(base.cont, enabled=False))
+    app = create_app(cfg)
+    http_client = FakeClient([
+        FakeResp(_round("rs_http", "ENC_HTTP", 999, msg="http done"))
+    ])
+    ws_calls: list[dict] = []
+
+    async def forbidden_ws_connector(**kwargs):
+        ws_calls.append(kwargs)
+        raise AssertionError("HTTP downstream must not open an upstream WebSocket")
+
+    with TestClient(app) as client:
+        app.state.client = http_client
+        app.state.ws_connector = forbidden_ws_connector
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.5",
+                "stream": True,
+                "input": [{"role": "user", "content": "http"}],
+            },
+        )
+
+    check("http downstream receives upstream http response", response.status_code == 200)
+    check("http downstream uses the http client exactly once",
+          len(http_client.payloads) == 1, str(http_client.payloads))
+    check("http downstream never opens upstream ws", not ws_calls, str(ws_calls))
+
+
+def test_websocket_handshake_504_is_returned_without_crashing():
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+
+    async def failing_connector(**kwargs):
+        raise UpstreamWebSocketError(
+            "Upstream WebSocket handshake failed", status_code=504
+        )
+
+    with TestClient(app) as client:
+        app.state.ws_connector = failing_connector
+        with client.websocket_connect("/v1/responses") as ws:
+            ws.send_json({
+                "type": "response.create",
+                "model": "gpt-5.5",
+                "input": [{"role": "user", "content": "trigger handshake"}],
+            })
+            event = ws.receive_json()
+
+    check("ws upstream handshake 504 is returned as an error event",
+          event.get("type") == "error" and event.get("status") == 504,
+          str(event))
+    check("ws upstream handshake 504 has a stable proxy error code",
+          (event.get("error") or {}).get("code") == "upstream_connection_error",
+          str(event))
+
+
 def test_websocket_route_streams_events():
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
-    resp = FakeResp(_round("rs_ws", "ENC_WS", 999, msg="done"))
+    connector = FakeWsConnector([
+        FakeResp(_round("rs_ws", "ENC_WS", 999, msg="done"))
+    ])
 
     with TestClient(app) as client:
-        app.state.client = FakeClient([resp])
+        app.state.ws_connector = connector
         with client.websocket_connect("/v1/responses") as ws:
             ws.send_json(
                 {
@@ -723,14 +954,23 @@ def test_websocket_route_streams_events():
     check("ws route emits terminal", "response.completed" in types, str(types[-2:]))
     deltas = "".join(e.get("delta", "") for e in evs if e.get("type") == "response.output_text.delta")
     check("ws route forwards text delta", deltas == "done", deltas)
+    check("ws route opens exactly one upstream ws session",
+          len(connector.sessions) == 1, str(len(connector.sessions)))
+    check("ws route sends response.create over upstream ws",
+          len(connector.payloads) == 1
+          and connector.payloads[0].get("type") == "response.create",
+          str(connector.payloads))
+    check("ws wire payload omits HTTP stream field",
+          "stream" not in connector.payloads[0], str(connector.payloads[0]))
 
 
 async def test_websocket_disconnect_cancels_waiting_upstream():
     cfg = load_config(ROOT / "config.toml")
-    upstream = BlockingClient()
+    upstream = BlockingWsConnector()
     app = SimpleNamespace(state=SimpleNamespace(
         cfg=cfg,
-        client=upstream,
+        client=FakeClient([]),
+        ws_connector=upstream,
         id_store=IdStore(),
         payload_logger=None,
     ))
@@ -738,7 +978,7 @@ async def test_websocket_disconnect_cancels_waiting_upstream():
     handler = asyncio.create_task(handle_responses_ws(websocket))
 
     await websocket.send_response_create()
-    await asyncio.wait_for(upstream.started.wait(), timeout=1)
+    await asyncio.wait_for(upstream.session.started.wait(), timeout=1)
     await websocket.disconnect()
 
     done, _ = await asyncio.wait({handler}, timeout=1)
@@ -754,7 +994,9 @@ async def test_websocket_disconnect_cancels_waiting_upstream():
         await asyncio.gather(handler, return_exceptions=True)
 
     check("ws disconnect cancels upstream waiting for headers",
-          upstream.cancelled.is_set())
+          upstream.session.cancelled.is_set())
+    check("ws disconnect closes corresponding upstream ws session",
+          upstream.session.closed.is_set())
     check("ws disconnect ends handler promptly", completed_promptly)
     check("ws disconnect cancellation is handled cleanly",
           handler_error is None, repr(handler_error))
@@ -763,10 +1005,28 @@ async def test_websocket_disconnect_cancels_waiting_upstream():
 def test_websocket_warmup_generate_false():
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
-    client_stub = FakeClient([FakeResp(_round("rs_after_warm", "ENC", 999, msg="after warmup"))])
+    warmup_response = make_sse([
+        {
+            "type": "response.created",
+            "response": {"id": "resp_warm_native", "status": "in_progress"},
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_warm_native",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            },
+        },
+    ])
+    connector = FakeWsConnector([
+        FakeResp(warmup_response),
+        FakeResp(_round("rs_after_warm", "ENC", 999, msg="after warmup")),
+    ])
 
     with TestClient(app) as client:
-        app.state.client = client_stub
+        app.state.ws_connector = connector
         with client.websocket_connect("/v1/responses") as ws:
             ws.send_json(
                 {
@@ -795,10 +1055,14 @@ def test_websocket_warmup_generate_false():
 
     check("ws warmup emits created", ev1.get("type") == "response.created", str(ev1))
     check("ws warmup emits completed", ev2.get("type") == "response.completed", str(ev2))
-    check("ws warmup returns synthetic response id",
-          str((ev2.get("response") or {}).get("id")).startswith("resp_warmup_"),
+    check("ws warmup returns native upstream response id",
+          (ev2.get("response") or {}).get("id") == "resp_warm_native",
           str((ev2.get("response") or {}).get("id")))
-    merged = client_stub.payloads[0] if client_stub.payloads else {}
+    check("ws warmup is forwarded upstream",
+          connector.phases[:1] == ["warmup"]
+          and connector.payloads[0].get("generate") is False,
+          str(connector.payloads[:1]))
+    merged = connector.payloads[1] if len(connector.payloads) > 1 else {}
     minput = merged.get("input") or []
     check("ws warmup merges cached input into next upstream request", len(minput) == 2, str(minput))
     check("ws warmup preserves cached tools on next upstream request",
@@ -808,13 +1072,15 @@ def test_websocket_warmup_generate_false():
           "previous_response_id" not in merged, str(merged))
 
 
-def test_websocket_strips_previous_response_id_for_codex_backend():
+def test_websocket_preserves_native_previous_response_id():
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
-    client_stub = FakeClient([FakeResp(_round("rs_prev", "ENC", 999, msg="done"))])
+    connector = FakeWsConnector([
+        FakeResp(_round("rs_prev", "ENC", 999, msg="done"))
+    ])
 
     with TestClient(app) as client:
-        app.state.client = client_stub
+        app.state.ws_connector = connector
         with client.websocket_connect("/v1/responses") as ws:
             ws.send_json(
                 {
@@ -829,9 +1095,9 @@ def test_websocket_strips_previous_response_id_for_codex_backend():
                 if ev.get("type") in ("response.completed", "response.failed", "response.incomplete"):
                     break
 
-    sent = client_stub.payloads[0] if client_stub.payloads else {}
-    check("ws strips unsupported previous_response_id before codex upstream",
-          "previous_response_id" not in sent, str(sent))
+    sent = connector.payloads[0] if connector.payloads else {}
+    check("ws preserves native previous_response_id for codex upstream",
+          sent.get("previous_response_id") == "resp_existing", str(sent))
 
 
 def test_websocket_replays_previous_tool_call_for_output():
@@ -844,13 +1110,13 @@ def test_websocket_replays_previous_tool_call_for_output():
         "call_id": "call_replay",
         "arguments": "{\"cmd\":\"pwd\"}",
     }
-    client_stub = FakeClient([
+    connector = FakeWsConnector([
         FakeResp(_round("rs_replay", "ENC_REPLAY", 999, extra_items=[tool])),
         FakeResp(_round("rs_done", "ENC_DONE", 999, msg="done")),
     ])
 
     with TestClient(app) as client:
-        app.state.client = client_stub
+        app.state.ws_connector = connector
         with client.websocket_connect("/v1/responses") as ws:
             ws.send_json(
                 {
@@ -893,7 +1159,7 @@ def test_websocket_replays_previous_tool_call_for_output():
                 ):
                     break
 
-    replayed = client_stub.payloads[1] if len(client_stub.payloads) > 1 else {}
+    replayed = connector.payloads[1] if len(connector.payloads) > 1 else {}
     replayed_input = replayed.get("input") or []
     replayed_types = [
         item.get("type") for item in replayed_input if isinstance(item, dict)
@@ -932,7 +1198,7 @@ def test_websocket_response_contexts_are_connection_local():
         "call_id": "call_connection_b",
         "arguments": "{}",
     }
-    client_stub = FakeClient([
+    connector = FakeWsConnector([
         FakeResp(_round("rs_a", "ENC_A", 999, extra_items=[tool_a])),
         FakeResp(_round("rs_b", "ENC_B", 999, extra_items=[tool_b])),
         FakeResp(_round("rs_done_a", "ENC_DONE_A", 999, msg="a done")),
@@ -950,7 +1216,7 @@ def test_websocket_response_contexts_are_connection_local():
                 return (ev.get("response") or {}).get("id")
 
     with TestClient(app) as client:
-        app.state.client = client_stub
+        app.state.ws_connector = connector
         with client.websocket_connect("/v1/responses") as ws_a:
             with client.websocket_connect("/v1/responses") as ws_b:
                 ws_a.send_json({
@@ -996,8 +1262,8 @@ def test_websocket_response_contexts_are_connection_local():
             if isinstance(item, dict) and item.get("type") == "function_call"
         ]
 
-    payload_a = client_stub.payloads[2] if len(client_stub.payloads) > 2 else {}
-    payload_b = client_stub.payloads[3] if len(client_stub.payloads) > 3 else {}
+    payload_a = connector.payloads[2] if len(connector.payloads) > 2 else {}
+    payload_b = connector.payloads[3] if len(connector.payloads) > 3 else {}
     check("connection a replays only its own function call",
           replayed_call_ids(payload_a) == ["call_connection_a"], str(payload_a))
     check("connection b replays only its own function call",
@@ -1014,13 +1280,13 @@ def test_payload_sqlite_records_ws_rounds():
         db_path = Path(td) / "payloads.sqlite3"
         cfg = replace(base, log=replace(base.log, payload_sqlite_path=str(db_path)))
         app = create_app(cfg)
-        client_stub = FakeClient([
+        connector = FakeWsConnector([
             FakeResp(_round("rs_log_a", "ENC_A", 516, msg="trunc")),
             FakeResp(_round("rs_log_b", "ENC_B", 999, msg="done")),
         ])
 
         with TestClient(app) as client:
-            app.state.client = client_stub
+            app.state.ws_connector = connector
             with client.websocket_connect("/v1/responses") as ws:
                 ws.send_json(
                     {
@@ -1049,8 +1315,11 @@ def test_payload_sqlite_records_ws_rounds():
         check("payload sqlite records first and continuation phases",
               phases == ["fold_round_1", "continuation"], str(phases))
         first_payload = json.loads(rows[0][5]) if rows else {}
-        check("payload sqlite stores sanitized outbound body",
-              "previous_response_id" not in first_payload, str(first_payload))
+        check("payload sqlite stores native ws outbound body",
+              first_payload.get("type") == "response.create"
+              and first_payload.get("previous_response_id") == "resp_existing"
+              and "stream" not in first_payload,
+              str(first_payload))
         check("payload sqlite records status code",
               rows[0][3] == 200 and rows[1][3] == 200 if rows else False, str(rows))
 
@@ -1154,10 +1423,13 @@ async def _main():
     test_reasoning_gate()
     test_stateful_repair()
     await test_eof_incomplete()
+    await test_native_upstream_websocket_reuses_connection()
+    test_http_downstream_keeps_http_upstream()
+    test_websocket_handshake_504_is_returned_without_crashing()
     test_websocket_route_streams_events()
     await test_websocket_disconnect_cancels_waiting_upstream()
     test_websocket_warmup_generate_false()
-    test_websocket_strips_previous_response_id_for_codex_backend()
+    test_websocket_preserves_native_previous_response_id()
     test_websocket_replays_previous_tool_call_for_output()
     test_websocket_response_contexts_are_connection_local()
     test_payload_sqlite_records_ws_rounds()

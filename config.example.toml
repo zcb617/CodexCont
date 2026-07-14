@@ -4,6 +4,8 @@ port = 8787
 listen_paths = ["/v1/responses"]
 
 [upstream]
+# HTTP downstream uses this URL as HTTP. WebSocket downstream automatically
+# maps https:// to wss:// (and http:// to ws://) for the same endpoint.
 url = "https://chatgpt.com/backend-api/codex/responses"
 mode = "header"                    # "fixed" = always use url; "header" = Responses-API-Base header (a BASE url, /responses appended) overrides url (else url); "header_required" = header MUST be present (else 400). Header is stripped before forwarding.
 # OPTIONAL explicit header overrides, applied last; EMPTY by default — the proxy
