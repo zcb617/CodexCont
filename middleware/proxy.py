@@ -8,10 +8,13 @@ gate — message and function_call output are treated identically.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any, AsyncIterator, Iterator
+import uuid
 
 import httpx
 
@@ -31,6 +34,199 @@ log = logging.getLogger("middleware.proxy")
 
 _TERMINAL = ("response.completed", "response.failed", "response.incomplete")
 _USAGE_TOP = ("input_tokens", "output_tokens", "total_tokens")
+_DIAG_ATTR = "_codexcont_upstream_diagnostics"
+_UPSTREAM_ID_HEADERS = (
+    "x-request-id",
+    "openai-request-id",
+    "request-id",
+    "cf-ray",
+    "x-envoy-upstream-service-time",
+    "server-timing",
+    "retry-after",
+)
+
+
+def _elapsed_ms(started: float) -> float:
+    return (time.perf_counter() - started) * 1000
+
+
+def _response_header_ids(headers: Any) -> str:
+    found: list[str] = []
+    for name in _UPSTREAM_ID_HEADERS:
+        try:
+            value = headers.get(name)
+        except (AttributeError, TypeError):
+            value = None
+        if value:
+            found.append(f"{name}:{value}")
+    return ",".join(found) or "-"
+
+
+def _response_diag(response: Any) -> dict[str, Any]:
+    diag = getattr(response, _DIAG_ATTR, None)
+    return diag if isinstance(diag, dict) else {}
+
+
+def upstream_request_id(response: Any) -> str:
+    """Return the local correlation id assigned to an upstream HTTP request."""
+    return str(_response_diag(response).get("request_id") or "-")
+
+
+async def _send_upstream_request(
+    client: httpx.AsyncClient,
+    url: str,
+    body: bytes,
+    headers: dict[str, str],
+    *,
+    payload: Any,
+    payload_logger: Any | None,
+    transport: str,
+    phase: str,
+    trace_id: str,
+) -> httpx.Response:
+    request_id = f"up_{uuid.uuid4().hex[:16]}"
+    started = time.perf_counter()
+    model = payload.get("model") if isinstance(payload, dict) else None
+    input_items = len(payload.get("input") or []) if isinstance(payload, dict) else -1
+    log.info(
+        "event=upstream_request_start request_id=%s trace_id=%s transport=%s "
+        "phase=%s method=POST url=%s model=%s input_items=%d body_bytes=%d",
+        request_id, trace_id or "-", transport or "-", phase or "-", url,
+        model or "-", input_items, len(body),
+    )
+
+    req = client.build_request("POST", url, content=body, headers=headers, timeout=None)
+    try:
+        response = await client.send(req, stream=True)
+    except asyncio.CancelledError:
+        log.warning(
+            "event=upstream_request_cancelled request_id=%s trace_id=%s phase=%s "
+            "elapsed_ms=%.2f",
+            request_id, trace_id or "-", phase or "-", _elapsed_ms(started),
+        )
+        raise
+    except Exception as exc:
+        log.warning(
+            "event=upstream_request_exception request_id=%s trace_id=%s phase=%s "
+            "elapsed_ms=%.2f error_type=%s error=%r",
+            request_id, trace_id or "-", phase or "-", _elapsed_ms(started),
+            type(exc).__name__, exc,
+        )
+        raise
+
+    diag = {
+        "request_id": request_id,
+        "trace_id": trace_id or "-",
+        "transport": transport or "-",
+        "phase": phase or "-",
+        "started": started,
+    }
+    setattr(response, _DIAG_ATTR, diag)
+    log.info(
+        "event=upstream_response_headers request_id=%s trace_id=%s phase=%s "
+        "status=%s elapsed_ms=%.2f upstream_ids=%s",
+        request_id, trace_id or "-", phase or "-", response.status_code,
+        _elapsed_ms(started), _response_header_ids(response.headers),
+    )
+
+    if payload_logger is not None:
+        payload_logger.record(
+            transport=transport,
+            phase=phase,
+            url=url,
+            payload=payload,
+            status_code=response.status_code,
+        )
+    return response
+
+
+async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
+    """Yield an upstream body while logging first-byte and stream lifetime."""
+    diag = _response_diag(response)
+    request_id = str(diag.get("request_id") or "-")
+    trace_id = str(diag.get("trace_id") or "-")
+    phase = str(diag.get("phase") or "-")
+    started = float(diag.get("started") or time.perf_counter())
+    first = True
+    total_bytes = 0
+    reached_eof = False
+    try:
+        async for chunk in response.aiter_bytes():
+            total_bytes += len(chunk)
+            if first:
+                first = False
+                log.info(
+                    "event=upstream_first_body_byte request_id=%s trace_id=%s "
+                    "phase=%s elapsed_ms=%.2f chunk_bytes=%d",
+                    request_id, trace_id, phase, _elapsed_ms(started), len(chunk),
+                )
+            yield chunk
+        reached_eof = True
+    except asyncio.CancelledError:
+        log.warning(
+            "event=upstream_stream_cancelled request_id=%s trace_id=%s phase=%s "
+            "elapsed_ms=%.2f body_bytes=%d",
+            request_id, trace_id, phase, _elapsed_ms(started), total_bytes,
+        )
+        raise
+    except Exception as exc:
+        log.warning(
+            "event=upstream_stream_exception request_id=%s trace_id=%s phase=%s "
+            "elapsed_ms=%.2f body_bytes=%d error_type=%s error=%r",
+            request_id, trace_id, phase, _elapsed_ms(started), total_bytes,
+            type(exc).__name__, exc,
+        )
+        raise
+    finally:
+        log.info(
+            "event=upstream_stream_end request_id=%s trace_id=%s phase=%s "
+            "outcome=%s elapsed_ms=%.2f body_bytes=%d",
+            request_id, trace_id, phase, "eof" if reached_eof else "consumer_closed",
+            _elapsed_ms(started), total_bytes,
+        )
+
+
+async def read_upstream_error(response: Any) -> bytes:
+    """Read a non-2xx body and log its timing under the same request id."""
+    diag = _response_diag(response)
+    request_id = str(diag.get("request_id") or "-")
+    trace_id = str(diag.get("trace_id") or "-")
+    phase = str(diag.get("phase") or "-")
+    started = float(diag.get("started") or time.perf_counter())
+    body_started = time.perf_counter()
+    log.info(
+        "event=upstream_error_body_start request_id=%s trace_id=%s phase=%s "
+        "status=%s elapsed_ms=%.2f",
+        request_id, trace_id, phase, response.status_code, _elapsed_ms(started),
+    )
+    try:
+        body = await response.aread()
+    except asyncio.CancelledError:
+        log.warning(
+            "event=upstream_error_body_cancelled request_id=%s trace_id=%s phase=%s "
+            "status=%s total_elapsed_ms=%.2f body_read_ms=%.2f",
+            request_id, trace_id, phase, response.status_code, _elapsed_ms(started),
+            _elapsed_ms(body_started),
+        )
+        raise
+    except Exception as exc:
+        log.warning(
+            "event=upstream_error_body_exception request_id=%s trace_id=%s phase=%s "
+            "status=%s total_elapsed_ms=%.2f body_read_ms=%.2f "
+            "error_type=%s error=%r",
+            request_id, trace_id, phase, response.status_code, _elapsed_ms(started),
+            _elapsed_ms(body_started), type(exc).__name__, exc,
+        )
+        raise
+
+    preview = body[:1000].decode("utf-8", errors="replace").replace("\n", "\\n")
+    log.warning(
+        "event=upstream_error_body_end request_id=%s trace_id=%s phase=%s "
+        "status=%s total_elapsed_ms=%.2f body_read_ms=%.2f body_bytes=%d body=%r",
+        request_id, trace_id, phase, response.status_code, _elapsed_ms(started),
+        _elapsed_ms(body_started), len(body), preview,
+    )
+    return body
 
 
 async def open_round(
@@ -42,6 +238,7 @@ async def open_round(
     payload_logger: Any | None = None,
     transport: str = "",
     phase: str = "",
+    trace_id: str = "",
 ) -> httpx.Response:
     """Open a streaming upstream request (caller must aclose the response).
 
@@ -49,17 +246,14 @@ async def open_round(
     invent a Content-Type — it comes from the passed-through agent headers.
     """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = client.build_request("POST", url, content=body, headers=headers, timeout=None)
-    resp = await client.send(req, stream=True)
-    if payload_logger is not None:
-        payload_logger.record(
-            transport=transport,
-            phase=phase,
-            url=url,
-            payload=payload,
-            status_code=resp.status_code,
-        )
-    return resp
+    return await _send_upstream_request(
+        client, url, body, headers,
+        payload=payload,
+        payload_logger=payload_logger,
+        transport=transport,
+        phase=phase,
+        trace_id=trace_id,
+    )
 
 
 async def open_passthrough(
@@ -71,23 +265,21 @@ async def open_passthrough(
     payload_logger: Any | None = None,
     transport: str = "",
     phase: str = "",
+    trace_id: str = "",
 ) -> httpx.Response:
     """Open a streaming upstream request forwarding the raw body unchanged."""
-    req = client.build_request("POST", url, content=raw_body, headers=headers, timeout=None)
-    resp = await client.send(req, stream=True)
-    if payload_logger is not None:
-        try:
-            payload: Any = json.loads(raw_body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            payload = {"_raw": raw_body.decode("utf-8", errors="replace")}
-        payload_logger.record(
-            transport=transport,
-            phase=phase,
-            url=url,
-            payload=payload,
-            status_code=resp.status_code,
-        )
-    return resp
+    try:
+        payload: Any = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = {"_raw": raw_body.decode("utf-8", errors="replace")}
+    return await _send_upstream_request(
+        client, url, raw_body, headers,
+        payload=payload,
+        payload_logger=payload_logger,
+        transport=transport,
+        phase=phase,
+        trace_id=trace_id,
+    )
 
 
 async def _tee(aiter: AsyncIterator[bytes], dump_path: Path) -> AsyncIterator[bytes]:
@@ -326,6 +518,7 @@ async def fold_stream(
     url: str | None = None,
     payload_logger: Any | None = None,
     transport: str = "",
+    trace_id: str = "",
 ) -> AsyncIterator[bytes]:
     """Yield the folded downstream SSE byte stream. `first_response` is the
     already-opened (2xx) round-1 upstream response; later rounds are opened here
@@ -360,7 +553,7 @@ async def fold_stream(
             terminal: dict[str, Any] | None = None
             usage: dict[str, Any] | None = None
 
-            byte_src = response.aiter_bytes()
+            byte_src = observed_response_bytes(response)
             if cfg.log.dump_rounds_dir:
                 dump_dir = Path(cfg.log.dump_rounds_dir)
                 dump_dir.mkdir(parents=True, exist_ok=True)
@@ -517,9 +710,10 @@ async def fold_stream(
                     payload_logger=payload_logger,
                     transport=transport,
                     phase="continuation",
+                    trace_id=trace_id,
                 )
                 if response.status_code >= 400:
-                    body = (await response.aread())[:2000]
+                    body = (await read_upstream_error(response))[:2000]
                     await response.aclose()
                     log.warning("continuation round %d failed: %s %s", round_no + 1,
                                 response.status_code, body)

@@ -30,7 +30,14 @@ from .codex import (
 from .config import Config
 from .creds import build_upstream_headers, would_inject_authorization
 from .payload_log import SQLitePayloadLogger
-from .proxy import fold_stream, open_passthrough, open_round
+from .proxy import (
+    fold_stream,
+    observed_response_bytes,
+    open_passthrough,
+    open_round,
+    read_upstream_error,
+    upstream_request_id,
+)
 from .sse import DONE, incremental_sse
 from .store import IdStore
 
@@ -303,6 +310,7 @@ async def _passthrough(
     raw: bytes,
     url: str,
     payload_logger: Any | None = None,
+    trace_id: str = "",
 ):
     """Pure proxy: forward the raw request and stream the raw response back."""
     headers = build_upstream_headers(request.headers.items(), cfg)
@@ -314,11 +322,12 @@ async def _passthrough(
         payload_logger=payload_logger,
         transport="http",
         phase="passthrough",
+        trace_id=trace_id,
     )
 
     async def body_iter():
         try:
-            async for chunk in resp.aiter_bytes():
+            async for chunk in observed_response_bytes(resp):
                 yield chunk
         finally:
             await resp.aclose()
@@ -334,6 +343,8 @@ async def handle_responses(request: Request) -> Response:
     cfg: Config = request.app.state.cfg
     client: httpx.AsyncClient = request.app.state.client
     payload_logger = getattr(request.app.state, "payload_logger", None)
+    trace_id = f"http_{uuid.uuid4().hex[:16]}"
+    started = time.perf_counter()
 
     raw = await request.body()
     try:
@@ -342,6 +353,13 @@ async def handle_responses(request: Request) -> Response:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+
+    log.info(
+        "event=downstream_request_start trace_id=%s transport=http path=%s "
+        "model=%s input_items=%d body_bytes=%d",
+        trace_id, request.url.path, body.get("model") or "-",
+        len(body.get("input") or []), len(raw),
+    )
 
     url = _resolve_upstream_url(cfg, request)
     if url is None:
@@ -363,10 +381,13 @@ async def handle_responses(request: Request) -> Response:
                  why, body.get("model"), request.url.path, url)
         upstream_body = _body_for_upstream(body, url)
         upstream_raw = _json_body_bytes(upstream_body) if upstream_body is not body else raw
-        return await _passthrough(client, cfg, request, upstream_raw, url, payload_logger)
+        return await _passthrough(
+            client, cfg, request, upstream_raw, url, payload_logger, trace_id
+        )
 
-    log.info("fold start: model=%s path=%s url=%s input_items=%d",
-             body.get("model"), request.url.path, url, len(body.get("input") or []))
+    log.info("fold start: trace_id=%s model=%s path=%s url=%s input_items=%d",
+             trace_id, body.get("model"), request.url.path, url,
+             len(body.get("input") or []))
 
     # repair_followup="stateful": re-insert tool_pair continue pairs after recorded
     # ids (tool_pair only — commentary preserves cross-turn structure via forward_marker).
@@ -400,10 +421,17 @@ async def handle_responses(request: Request) -> Response:
         payload_logger=payload_logger,
         transport="http",
         phase="fold_round_1",
+        trace_id=trace_id,
     )
     if resp.status_code >= 400:
-        err = await resp.aread()
+        err = await read_upstream_error(resp)
         await resp.aclose()
+        log.info(
+            "event=downstream_request_end trace_id=%s transport=http outcome=upstream_error "
+            "upstream_request_id=%s status=%s elapsed_ms=%.2f",
+            trace_id, upstream_request_id(resp), resp.status_code,
+            (time.perf_counter() - started) * 1000,
+        )
         return Response(
             err, status_code=resp.status_code, media_type=resp.headers.get("content-type")
         )
@@ -419,6 +447,7 @@ async def handle_responses(request: Request) -> Response:
             url=url,
             payload_logger=payload_logger,
             transport="http",
+            trace_id=trace_id,
         ),
         media_type="text/event-stream",
     )
@@ -431,11 +460,21 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     payload_logger = getattr(websocket.app.state, "payload_logger", None)
     warmups: dict[str, dict[str, Any]] = {}
     response_contexts: dict[str, list[Any]] = {}
+    connection_id = f"ws_{uuid.uuid4().hex[:16]}"
+    request_no = 0
+    log.info(
+        "event=downstream_ws_open connection_id=%s path=%s client=%s",
+        connection_id, websocket.url.path, websocket.client,
+    )
 
     while True:
         try:
             msg = await websocket.receive_json()
         except WebSocketDisconnect:
+            log.info(
+                "event=downstream_ws_disconnect connection_id=%s requests=%d",
+                connection_id, request_no,
+            )
             return
         except Exception:
             await websocket.send_json(
@@ -457,6 +496,10 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
             )
             continue
 
+        request_no += 1
+        trace_id = f"{connection_id}.{request_no}"
+        request_started = time.perf_counter()
+
         body = {k: v for k, v in msg.items() if k != "type"}
         body.pop("background", None)
         warmup = _is_ws_warmup(body)
@@ -470,6 +513,13 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 body, consumed_prev_id = _merge_previous_response_body(
                     response_contexts, body
                 )
+
+        log.info(
+            "event=downstream_request_start trace_id=%s transport=ws connection_id=%s "
+            "request_no=%d model=%s input_items=%d previous_response_id=%s",
+            trace_id, connection_id, request_no, body.get("model") or "-",
+            len(body.get("input") or []), "present" if body.get("previous_response_id") else "absent",
+        )
 
         url = _resolve_upstream_url(cfg, websocket)
         if url is None:
@@ -497,8 +547,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 await websocket.send_json(ev)
             continue
         elif should_fold:
-            log.info("fold start(ws): model=%s path=%s url=%s input_items=%d",
-                     upstream_body.get("model"), websocket.url.path, url,
+            log.info("fold start(ws): trace_id=%s model=%s path=%s url=%s input_items=%d",
+                     trace_id, upstream_body.get("model"), websocket.url.path, url,
                      len(upstream_body.get("input") or []))
             payload = build_round_payload(
                 upstream_body,
@@ -514,6 +564,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 payload_logger=payload_logger,
                 transport="ws",
                 phase="fold_round_1",
+                trace_id=trace_id,
             )
         else:
             why = _passthrough_reason(cfg, body)
@@ -527,11 +578,18 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 payload_logger=payload_logger,
                 transport="ws",
                 phase="passthrough",
+                trace_id=trace_id,
             )
 
         if resp.status_code >= 400:
-            err = await resp.aread()
+            err = await read_upstream_error(resp)
             await resp.aclose()
+            log.warning(
+                "event=downstream_error_send trace_id=%s connection_id=%s "
+                "upstream_request_id=%s status=%s elapsed_ms=%.2f",
+                trace_id, connection_id, upstream_request_id(resp), resp.status_code,
+                (time.perf_counter() - request_started) * 1000,
+            )
             await websocket.send_json(_upstream_error_event(err, resp.status_code))
             continue
 
@@ -548,6 +606,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                         url=url,
                         payload_logger=payload_logger,
                         transport="ws",
+                        trace_id=trace_id,
                     )
                 )
                 async for ev in event_iter:
@@ -565,7 +624,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                     await websocket.send_json(ev)
             else:
                 try:
-                    async for ev in _iter_sse_events(resp.aiter_bytes()):
+                    async for ev in _iter_sse_events(observed_response_bytes(resp)):
                         if ev.get("type") in (
                             "response.completed",
                             "response.failed",
@@ -581,7 +640,19 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 finally:
                     await resp.aclose()
         except WebSocketDisconnect:
+            log.warning(
+                "event=downstream_ws_disconnect_active trace_id=%s connection_id=%s "
+                "elapsed_ms=%.2f",
+                trace_id, connection_id,
+                (time.perf_counter() - request_started) * 1000,
+            )
             return
+        else:
+            log.info(
+                "event=downstream_request_end trace_id=%s transport=ws outcome=stream_end "
+                "elapsed_ms=%.2f",
+                trace_id, (time.perf_counter() - request_started) * 1000,
+            )
 
 
 def _make_client() -> httpx.AsyncClient:

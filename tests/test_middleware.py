@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import sys
 import tempfile
@@ -37,7 +38,8 @@ from middleware.codex import (
 )
 from middleware.config import load_config
 from middleware.creds import build_upstream_headers, would_inject_authorization
-from middleware.proxy import fold_stream
+from middleware import proxy as proxy_module
+from middleware.proxy import fold_stream, open_round, read_upstream_error
 from middleware.sse import DONE, incremental_sse
 from middleware.store import IdStore
 
@@ -107,6 +109,15 @@ class FakeClient:
 
     async def aclose(self) -> None:
         pass
+
+
+class CaptureHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
 
 
 async def run_fold(cfg, base_body, first_resp, later_resps) -> list:
@@ -984,6 +995,58 @@ def test_payload_sqlite_initialized_on_startup():
               "outbound_payloads" in names, str(names))
 
 
+async def test_upstream_diagnostic_logs_correlate_504():
+    response = FakeResp(b'{"error":{"message":"gateway timeout"}}', status=504)
+    response.headers = {"x-request-id": "upstream-test-id"}
+    client = FakeClient([response])
+    capture = CaptureHandler()
+    logger = proxy_module.log
+    old_level = logger.level
+    old_propagate = logger.propagate
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(capture)
+    try:
+        opened = await open_round(
+            client,
+            "https://example.test/responses",
+            {"model": "test-model", "input": [{"role": "user", "content": "q"}]},
+            {},
+            transport="ws",
+            phase="fold_round_1",
+            trace_id="trace_test_504",
+        )
+        await read_upstream_error(opened)
+    finally:
+        logger.removeHandler(capture)
+        logger.setLevel(old_level)
+        logger.propagate = old_propagate
+
+    starts = [m for m in capture.messages if "event=upstream_request_start" in m]
+    headers = [m for m in capture.messages if "event=upstream_response_headers" in m]
+    bodies = [m for m in capture.messages if "event=upstream_error_body_end" in m]
+
+    def field(message: str, name: str) -> str | None:
+        prefix = f"{name}="
+        return next(
+            (part[len(prefix):] for part in message.split() if part.startswith(prefix)),
+            None,
+        )
+
+    ids = [field(messages[0], "request_id") for messages in (starts, headers, bodies) if messages]
+    check("diagnostic logs emit start, headers, and error body",
+          len(starts) == len(headers) == len(bodies) == 1, str(capture.messages))
+    check("diagnostic logs correlate 504 with one request id",
+          len(ids) == 3 and len(set(ids)) == 1 and ids[0] not in (None, "-"), str(ids))
+    check("diagnostic headers log trace, status, elapsed, and upstream id",
+          bool(headers)
+          and "trace_id=trace_test_504" in headers[0]
+          and "status=504" in headers[0]
+          and "elapsed_ms=" in headers[0]
+          and "x-request-id:upstream-test-id" in headers[0],
+          headers[0] if headers else "missing")
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -1009,6 +1072,7 @@ async def _main():
     test_websocket_response_contexts_are_connection_local()
     test_payload_sqlite_records_ws_rounds()
     test_payload_sqlite_initialized_on_startup()
+    await test_upstream_diagnostic_logs_correlate_504()
 
 
 def main():
