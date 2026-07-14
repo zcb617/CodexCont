@@ -6,6 +6,7 @@ so it is safe in front of all traffic.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -453,29 +454,138 @@ async def handle_responses(request: Request) -> Response:
     )
 
 
+async def _receive_ws_messages(
+    websocket: WebSocket,
+    inbox: asyncio.Queue[dict[str, Any]],
+) -> dict[str, Any]:
+    """Receive downstream frames until the peer disconnects.
+
+    This runs independently from upstream processing so a disconnect remains
+    observable while ``httpx`` is still waiting for response headers.
+    """
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            return message
+        await inbox.put(message)
+
+
+async def _receive_ws_json(inbox: asyncio.Queue[dict[str, Any]]) -> Any:
+    message = await inbox.get()
+    if message.get("type") != "websocket.receive":
+        raise RuntimeError(f"Unexpected ASGI WebSocket message: {message.get('type')}")
+
+    text = message.get("text")
+    if text is None:
+        data = message.get("bytes")
+        if data is None:
+            raise RuntimeError("WebSocket receive message contained neither text nor bytes")
+        text = data.decode("utf-8")
+    return json.loads(text)
+
+
+async def _close_active_ws_response(activity: dict[str, Any]) -> None:
+    response = activity.pop("response", None)
+    if response is None:
+        return
+    try:
+        await response.aclose()
+    except Exception as exc:
+        log.warning(
+            "event=upstream_response_close_exception trace_id=%s error_type=%s error=%r",
+            activity.get("trace_id") or "-", type(exc).__name__, exc,
+        )
+
+
 async def handle_responses_ws(websocket: WebSocket) -> None:
     await websocket.accept()
-    cfg: Config = websocket.app.state.cfg
-    client: httpx.AsyncClient = websocket.app.state.client
-    payload_logger = getattr(websocket.app.state, "payload_logger", None)
-    warmups: dict[str, dict[str, Any]] = {}
-    response_contexts: dict[str, list[Any]] = {}
     connection_id = f"ws_{uuid.uuid4().hex[:16]}"
-    request_no = 0
+    activity: dict[str, Any] = {
+        "request_no": 0,
+        "trace_id": None,
+        "request_started": None,
+        "response": None,
+    }
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     log.info(
         "event=downstream_ws_open connection_id=%s path=%s client=%s",
         connection_id, websocket.url.path, websocket.client,
     )
 
+    receiver = asyncio.create_task(
+        _receive_ws_messages(websocket, inbox),
+        name=f"{connection_id}-receiver",
+    )
+    processor = asyncio.create_task(
+        _process_responses_ws(websocket, inbox, connection_id, activity),
+        name=f"{connection_id}-processor",
+    )
+
+    try:
+        done, _ = await asyncio.wait(
+            {receiver, processor}, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if receiver in done:
+            disconnect = receiver.result()
+            trace_id = activity.get("trace_id")
+            request_started = activity.get("request_started")
+            processor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await processor
+            await _close_active_ws_response(activity)
+
+            if trace_id:
+                elapsed_ms = (
+                    (time.perf_counter() - request_started) * 1000
+                    if isinstance(request_started, (int, float)) else -1.0
+                )
+                log.warning(
+                    "event=downstream_ws_disconnect_cancel trace_id=%s connection_id=%s "
+                    "code=%s elapsed_ms=%.2f",
+                    trace_id, connection_id, disconnect.get("code"), elapsed_ms,
+                )
+            else:
+                log.info(
+                    "event=downstream_ws_disconnect connection_id=%s requests=%d code=%s",
+                    connection_id, activity.get("request_no", 0), disconnect.get("code"),
+                )
+            return
+
+        receiver.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await receiver
+        try:
+            await processor
+        except WebSocketDisconnect as exc:
+            log.info(
+                "event=downstream_ws_disconnect connection_id=%s requests=%d code=%s",
+                connection_id, activity.get("request_no", 0), exc.code,
+            )
+    finally:
+        for task in (receiver, processor):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(receiver, processor, return_exceptions=True)
+        await _close_active_ws_response(activity)
+
+
+async def _process_responses_ws(
+    websocket: WebSocket,
+    inbox: asyncio.Queue[dict[str, Any]],
+    connection_id: str,
+    activity: dict[str, Any],
+) -> None:
+    cfg: Config = websocket.app.state.cfg
+    client: httpx.AsyncClient = websocket.app.state.client
+    payload_logger = getattr(websocket.app.state, "payload_logger", None)
+    warmups: dict[str, dict[str, Any]] = {}
+    response_contexts: dict[str, list[Any]] = {}
+    request_no = 0
+
     while True:
         try:
-            msg = await websocket.receive_json()
-        except WebSocketDisconnect:
-            log.info(
-                "event=downstream_ws_disconnect connection_id=%s requests=%d",
-                connection_id, request_no,
-            )
-            return
+            msg = await _receive_ws_json(inbox)
         except Exception:
             await websocket.send_json(
                 _ws_error_event("Expected a JSON response.create event.", param="type")
@@ -497,6 +607,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
             continue
 
         request_no += 1
+        activity["request_no"] = request_no
         trace_id = f"{connection_id}.{request_no}"
         request_started = time.perf_counter()
 
@@ -547,6 +658,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 await websocket.send_json(ev)
             continue
         elif should_fold:
+            activity["trace_id"] = trace_id
+            activity["request_started"] = request_started
             log.info("fold start(ws): trace_id=%s model=%s path=%s url=%s input_items=%d",
                      trace_id, upstream_body.get("model"), websocket.url.path, url,
                      len(upstream_body.get("input") or []))
@@ -567,6 +680,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 trace_id=trace_id,
             )
         else:
+            activity["trace_id"] = trace_id
+            activity["request_started"] = request_started
             why = _passthrough_reason(cfg, body)
             log.info("passthrough(ws) (%s): model=%s path=%s url=%s",
                      why, body.get("model"), websocket.url.path, url)
@@ -581,9 +696,12 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 trace_id=trace_id,
             )
 
+        activity["response"] = resp
+
         if resp.status_code >= 400:
             err = await read_upstream_error(resp)
             await resp.aclose()
+            activity["response"] = None
             log.warning(
                 "event=downstream_error_send trace_id=%s connection_id=%s "
                 "upstream_request_id=%s status=%s elapsed_ms=%.2f",
@@ -591,6 +709,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 (time.perf_counter() - request_started) * 1000,
             )
             await websocket.send_json(_upstream_error_event(err, resp.status_code))
+            activity["trace_id"] = None
+            activity["request_started"] = None
             continue
 
         try:
@@ -639,6 +759,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                         await websocket.send_json(ev)
                 finally:
                     await resp.aclose()
+                    activity["response"] = None
         except WebSocketDisconnect:
             log.warning(
                 "event=downstream_ws_disconnect_active trace_id=%s connection_id=%s "
@@ -653,6 +774,9 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 "elapsed_ms=%.2f",
                 trace_id, (time.perf_counter() - request_started) * 1000,
             )
+        activity["response"] = None
+        activity["trace_id"] = None
+        activity["request_started"] = None
 
 
 def _make_client() -> httpx.AsyncClient:

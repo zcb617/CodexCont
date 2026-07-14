@@ -14,6 +14,7 @@ import sys
 import tempfile
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -24,6 +25,7 @@ from starlette.testclient import TestClient
 
 from middleware.app import (
     create_app,
+    handle_responses_ws,
     _make_client,
     _resolve_upstream_url,
     _url_is_from_header,
@@ -109,6 +111,58 @@ class FakeClient:
 
     async def aclose(self) -> None:
         pass
+
+
+class BlockingClient:
+    """An upstream client that only finishes when its send task is cancelled."""
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    def build_request(self, *a, **k):
+        return ("blocking-req", a, k)
+
+    async def send(self, req, stream=True):
+        self.started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class FakeDownstreamWebSocket:
+    def __init__(self, app):
+        self.app = app
+        self.headers = Headers({"authorization": "Bearer test"})
+        self.url = SimpleNamespace(path="/v1/responses")
+        self.client = ("test-client", 1234)
+        self.incoming: asyncio.Queue[dict] = asyncio.Queue()
+        self.sent: list[dict] = []
+        self.accepted = False
+
+    async def accept(self):
+        self.accepted = True
+
+    async def receive(self):
+        return await self.incoming.get()
+
+    async def send_json(self, data):
+        self.sent.append(data)
+
+    async def send_response_create(self):
+        await self.incoming.put({
+            "type": "websocket.receive",
+            "text": json.dumps({
+                "type": "response.create",
+                "model": "gpt-5.5",
+                "input": [{"role": "user", "content": "wait forever"}],
+            }),
+        })
+
+    async def disconnect(self):
+        await self.incoming.put({"type": "websocket.disconnect", "code": 1000})
 
 
 class CaptureHandler(logging.Handler):
@@ -671,6 +725,41 @@ def test_websocket_route_streams_events():
     check("ws route forwards text delta", deltas == "done", deltas)
 
 
+async def test_websocket_disconnect_cancels_waiting_upstream():
+    cfg = load_config(ROOT / "config.toml")
+    upstream = BlockingClient()
+    app = SimpleNamespace(state=SimpleNamespace(
+        cfg=cfg,
+        client=upstream,
+        id_store=IdStore(),
+        payload_logger=None,
+    ))
+    websocket = FakeDownstreamWebSocket(app)
+    handler = asyncio.create_task(handle_responses_ws(websocket))
+
+    await websocket.send_response_create()
+    await asyncio.wait_for(upstream.started.wait(), timeout=1)
+    await websocket.disconnect()
+
+    done, _ = await asyncio.wait({handler}, timeout=1)
+    completed_promptly = handler in done
+    handler_error = None
+    if completed_promptly:
+        try:
+            await handler
+        except BaseException as exc:
+            handler_error = exc
+    else:
+        handler.cancel()
+        await asyncio.gather(handler, return_exceptions=True)
+
+    check("ws disconnect cancels upstream waiting for headers",
+          upstream.cancelled.is_set())
+    check("ws disconnect ends handler promptly", completed_promptly)
+    check("ws disconnect cancellation is handled cleanly",
+          handler_error is None, repr(handler_error))
+
+
 def test_websocket_warmup_generate_false():
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
@@ -1066,6 +1155,7 @@ async def _main():
     test_stateful_repair()
     await test_eof_incomplete()
     test_websocket_route_streams_events()
+    await test_websocket_disconnect_cancels_waiting_upstream()
     test_websocket_warmup_generate_false()
     test_websocket_strips_previous_response_id_for_codex_backend()
     test_websocket_replays_previous_tool_call_for_output()
