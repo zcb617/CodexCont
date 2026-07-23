@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.client import connect as websockets_connect
 
+from .proxy import FIRST_BYTE_TIMEOUT_S, _remaining_first_byte_timeout
 from .sse import serialize_event
 
 log = logging.getLogger("middleware.ws_upstream")
@@ -228,8 +229,30 @@ class UpstreamWebSocketSession:
         )
 
         try:
-            await self._connection.send(encoded)
-            first_event = await self._receive_json()
+            # First event only — same wall-clock budget as HTTP first body byte.
+            async def _send_and_first_event() -> dict[str, Any]:
+                await self._connection.send(encoded)
+                return await self._receive_json()
+
+            first_event = await asyncio.wait_for(
+                _send_and_first_event(),
+                timeout=_remaining_first_byte_timeout(started),
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "event=upstream_first_byte_timeout request_id=%s trace_id=%s phase=%s "
+                "elapsed_ms=%.2f stage=ws_first_event timeout_s=%.1f",
+                request_id,
+                trace_id or "-",
+                phase or "-",
+                (time.perf_counter() - started) * 1000,
+                FIRST_BYTE_TIMEOUT_S,
+            )
+            await self._drop_connection()
+            raise UpstreamWebSocketError(
+                f"Upstream WebSocket first-event timeout after {FIRST_BYTE_TIMEOUT_S:.0f}s",
+                status_code=504,
+            ) from None
         except asyncio.CancelledError:
             log.warning(
                 "event=upstream_request_cancelled request_id=%s trace_id=%s phase=%s "

@@ -970,6 +970,98 @@ def test_http_upstream_timeout_returns_504():
     )
 
 
+async def test_first_byte_timeout_on_headers():
+    """send() hanging past FIRST_BYTE_TIMEOUT_S becomes ReadTimeout."""
+    old = proxy_module.FIRST_BYTE_TIMEOUT_S
+    proxy_module.FIRST_BYTE_TIMEOUT_S = 0.05
+
+    class SlowHeaderClient(FakeClient):
+        async def send(self, req, stream=True):
+            await asyncio.sleep(1.0)
+            return await super().send(req, stream=stream)
+
+    client = SlowHeaderClient([FakeResp(b"data: {}\n\n")])
+    try:
+        raised = None
+        try:
+            await open_round(
+                client,
+                "https://example.test/responses",
+                {"model": "test", "input": []},
+                {},
+                transport="http",
+                phase="fold_round_1",
+                trace_id="trace_fb_headers",
+            )
+        except Exception as exc:
+            raised = exc
+    finally:
+        proxy_module.FIRST_BYTE_TIMEOUT_S = old
+
+    check(
+        "first-byte header hang raises ReadTimeout",
+        isinstance(raised, httpx.ReadTimeout) and "first-byte timeout" in str(raised),
+        repr(raised),
+    )
+
+
+async def test_first_byte_timeout_on_body_not_later_chunks():
+    """Only the first body chunk is timed; later chunks may idle freely."""
+    old = proxy_module.FIRST_BYTE_TIMEOUT_S
+    proxy_module.FIRST_BYTE_TIMEOUT_S = 0.05
+
+    class SlowFirstChunk(FakeResp):
+        async def aiter_bytes(self):
+            await asyncio.sleep(1.0)
+            yield b"event: response.created\ndata: {}\n\n"
+
+    class IdleAfterFirst(FakeResp):
+        async def aiter_bytes(self):
+            yield b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+            await asyncio.sleep(0.2)  # > FIRST_BYTE_TIMEOUT_S, must NOT time out
+            yield b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+
+    try:
+        # Slow first chunk → timeout
+        slow = SlowFirstChunk(b"")
+        setattr(slow, proxy_module._DIAG_ATTR, {
+            "request_id": "up_slow",
+            "trace_id": "t1",
+            "phase": "fold_round_1",
+            "started": __import__("time").perf_counter(),
+        })
+        raised = None
+        try:
+            async for _ in proxy_module.observed_response_bytes(slow):
+                pass
+        except Exception as exc:
+            raised = exc
+        check(
+            "first-byte body hang raises ReadTimeout",
+            isinstance(raised, httpx.ReadTimeout) and "first-byte timeout" in str(raised),
+            repr(raised),
+        )
+
+        # First chunk immediate, idle later → success
+        idle = IdleAfterFirst(b"")
+        setattr(idle, proxy_module._DIAG_ATTR, {
+            "request_id": "up_idle",
+            "trace_id": "t2",
+            "phase": "fold_round_1",
+            "started": __import__("time").perf_counter(),
+        })
+        chunks = []
+        async for c in proxy_module.observed_response_bytes(idle):
+            chunks.append(c)
+        check(
+            "post-first-byte idle is allowed",
+            len(chunks) == 2 and b"response.completed" in chunks[1],
+            str(chunks),
+        )
+    finally:
+        proxy_module.FIRST_BYTE_TIMEOUT_S = old
+
+
 def test_websocket_handshake_504_is_returned_without_crashing():
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
@@ -1499,6 +1591,8 @@ async def _main():
     test_http_downstream_keeps_http_upstream()
     test_http_upstream_read_error_returns_502_without_asgi_crash()
     test_http_upstream_timeout_returns_504()
+    await test_first_byte_timeout_on_headers()
+    await test_first_byte_timeout_on_body_not_later_chunks()
     test_websocket_handshake_504_is_returned_without_crashing()
     test_websocket_route_streams_events()
     await test_websocket_disconnect_cancels_waiting_upstream()

@@ -32,6 +32,11 @@ from .sse import DONE, incremental_sse, serialize_done, serialize_event
 
 log = logging.getLogger("middleware.proxy")
 
+# Wall-clock budget from upstream request start until the first response body
+# byte (headers + first chunk). After the first byte, the stream has no read
+# idle timeout — only this initial gate.
+FIRST_BYTE_TIMEOUT_S = 60.0
+
 _TERMINAL = ("response.completed", "response.failed", "response.incomplete")
 _USAGE_TOP = ("input_tokens", "output_tokens", "total_tokens")
 _DIAG_ATTR = "_codexcont_upstream_diagnostics"
@@ -44,6 +49,18 @@ _UPSTREAM_ID_HEADERS = (
     "server-timing",
     "retry-after",
 )
+
+
+def _remaining_first_byte_timeout(started: float) -> float:
+    """Seconds left in the first-byte budget; never negative."""
+    return max(0.0, FIRST_BYTE_TIMEOUT_S - (time.perf_counter() - started))
+
+
+def _first_byte_timeout_error(started: float) -> httpx.ReadTimeout:
+    return httpx.ReadTimeout(
+        f"upstream first-byte timeout after {FIRST_BYTE_TIMEOUT_S:.0f}s "
+        f"(elapsed_ms={_elapsed_ms(started):.2f})"
+    )
 
 
 def _elapsed_ms(started: float) -> float:
@@ -97,7 +114,20 @@ async def _send_upstream_request(
 
     req = client.build_request("POST", url, content=body, headers=headers, timeout=None)
     try:
-        response = await client.send(req, stream=True)
+        # Only the wait for response headers is budgeted here; the first body
+        # chunk is enforced in observed_response_bytes under the same deadline.
+        response = await asyncio.wait_for(
+            client.send(req, stream=True),
+            timeout=_remaining_first_byte_timeout(started),
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "event=upstream_first_byte_timeout request_id=%s trace_id=%s phase=%s "
+            "elapsed_ms=%.2f stage=headers timeout_s=%.1f",
+            request_id, trace_id or "-", phase or "-", _elapsed_ms(started),
+            FIRST_BYTE_TIMEOUT_S,
+        )
+        raise _first_byte_timeout_error(started) from None
     except asyncio.CancelledError:
         log.warning(
             "event=upstream_request_cancelled request_id=%s trace_id=%s phase=%s "
@@ -120,6 +150,7 @@ async def _send_upstream_request(
         "transport": transport or "-",
         "phase": phase or "-",
         "started": started,
+        "first_byte_deadline": started + FIRST_BYTE_TIMEOUT_S,
     }
     setattr(response, _DIAG_ATTR, diag)
     log.info(
@@ -141,25 +172,50 @@ async def _send_upstream_request(
 
 
 async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
-    """Yield an upstream body while logging first-byte and stream lifetime."""
+    """Yield an upstream body while logging first-byte and stream lifetime.
+
+    Enforces FIRST_BYTE_TIMEOUT_S only until the first body chunk arrives; the
+    remainder of the stream is untimed (no idle / total read timeout).
+    """
     diag = _response_diag(response)
     request_id = str(diag.get("request_id") or "-")
     trace_id = str(diag.get("trace_id") or "-")
     phase = str(diag.get("phase") or "-")
     started = float(diag.get("started") or time.perf_counter())
-    first = True
     total_bytes = 0
     reached_eof = False
+    body_iter = response.aiter_bytes()
+    body_aiter = body_iter.__aiter__()
     try:
-        async for chunk in response.aiter_bytes():
+        # First chunk: shared deadline with header wait in _send_upstream_request.
+        try:
+            first_chunk = await asyncio.wait_for(
+                body_aiter.__anext__(),
+                timeout=_remaining_first_byte_timeout(started),
+            )
+        except StopAsyncIteration:
+            reached_eof = True
+            return
+        except asyncio.TimeoutError:
+            log.warning(
+                "event=upstream_first_byte_timeout request_id=%s trace_id=%s phase=%s "
+                "elapsed_ms=%.2f stage=body timeout_s=%.1f body_bytes=%d",
+                request_id, trace_id, phase, _elapsed_ms(started),
+                FIRST_BYTE_TIMEOUT_S, total_bytes,
+            )
+            raise _first_byte_timeout_error(started) from None
+
+        total_bytes += len(first_chunk)
+        log.info(
+            "event=upstream_first_body_byte request_id=%s trace_id=%s "
+            "phase=%s elapsed_ms=%.2f chunk_bytes=%d",
+            request_id, trace_id, phase, _elapsed_ms(started), len(first_chunk),
+        )
+        yield first_chunk
+
+        # Subsequent chunks: no timeout (only first-byte is gated).
+        async for chunk in body_aiter:
             total_bytes += len(chunk)
-            if first:
-                first = False
-                log.info(
-                    "event=upstream_first_body_byte request_id=%s trace_id=%s "
-                    "phase=%s elapsed_ms=%.2f chunk_bytes=%d",
-                    request_id, trace_id, phase, _elapsed_ms(started), len(chunk),
-                )
             yield chunk
         reached_eof = True
     except asyncio.CancelledError:
@@ -168,6 +224,16 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
             "elapsed_ms=%.2f body_bytes=%d",
             request_id, trace_id, phase, _elapsed_ms(started), total_bytes,
         )
+        raise
+    except httpx.ReadTimeout as exc:
+        # first-byte timeout is already logged above; other read timeouts still log.
+        if "first-byte timeout" not in str(exc):
+            log.warning(
+                "event=upstream_stream_exception request_id=%s trace_id=%s phase=%s "
+                "elapsed_ms=%.2f body_bytes=%d error_type=%s error=%r",
+                request_id, trace_id, phase, _elapsed_ms(started), total_bytes,
+                type(exc).__name__, exc,
+            )
         raise
     except Exception as exc:
         log.warning(
