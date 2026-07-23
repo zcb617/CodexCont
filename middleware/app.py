@@ -179,6 +179,46 @@ def _ws_error_event(
     return {"type": "error", "status": status, "error": err}
 
 
+def _http_upstream_transport_status(exc: BaseException) -> int:
+    """Map an httpx transport failure to a gateway status for the agent."""
+    if isinstance(exc, httpx.TimeoutException):
+        return 504
+    return 502
+
+
+def _http_upstream_transport_response(
+    exc: BaseException,
+    *,
+    trace_id: str,
+    started: float,
+) -> JSONResponse:
+    """Turn an uncaught upstream transport error into a normal HTTP response.
+
+    Without this, ``httpx.ReadError`` (and friends) bubble out of the ASGI
+    handler and uvicorn logs ``Exception in ASGI application`` + a full
+    traceback even though the failure is an expected upstream/network fault.
+    """
+    status = _http_upstream_transport_status(exc)
+    log.info(
+        "event=downstream_request_end trace_id=%s transport=http "
+        "outcome=transport_error status=%s error_type=%s elapsed_ms=%.2f",
+        trace_id or "-",
+        status,
+        type(exc).__name__,
+        (time.perf_counter() - started) * 1000,
+    )
+    return JSONResponse(
+        {
+            "error": {
+                "message": "Upstream request failed",
+                "type": type(exc).__name__,
+                "code": "upstream_transport_error",
+            }
+        },
+        status_code=status,
+    )
+
+
 def _upstream_error_event(raw: bytes, status: int) -> dict[str, Any]:
     try:
         parsed = json.loads(raw)
@@ -259,19 +299,24 @@ async def _passthrough(
     url: str,
     payload_logger: Any | None = None,
     trace_id: str = "",
+    started: float | None = None,
 ):
     """Pure proxy: forward the raw request and stream the raw response back."""
     headers = build_upstream_headers(request.headers.items(), cfg)
-    resp = await open_passthrough(
-        client,
-        url,
-        raw,
-        headers,
-        payload_logger=payload_logger,
-        transport="http",
-        phase="passthrough",
-        trace_id=trace_id,
-    )
+    t0 = started if started is not None else time.perf_counter()
+    try:
+        resp = await open_passthrough(
+            client,
+            url,
+            raw,
+            headers,
+            payload_logger=payload_logger,
+            transport="http",
+            phase="passthrough",
+            trace_id=trace_id,
+        )
+    except httpx.HTTPError as exc:
+        return _http_upstream_transport_response(exc, trace_id=trace_id, started=t0)
 
     async def body_iter():
         try:
@@ -330,7 +375,7 @@ async def handle_responses(request: Request) -> Response:
         upstream_body = _body_for_upstream(body, url)
         upstream_raw = _json_body_bytes(upstream_body) if upstream_body is not body else raw
         return await _passthrough(
-            client, cfg, request, upstream_raw, url, payload_logger, trace_id
+            client, cfg, request, upstream_raw, url, payload_logger, trace_id, started
         )
 
     log.info("fold start: trace_id=%s model=%s path=%s url=%s input_items=%d",
@@ -361,16 +406,19 @@ async def handle_responses(request: Request) -> Response:
 
     # Open round 1 here so a non-2xx (e.g. bad auth) is mirrored with its real
     # status code rather than buried inside a 200 SSE stream.
-    resp = await open_round(
-        client,
-        url,
-        payload,
-        headers,
-        payload_logger=payload_logger,
-        transport="http",
-        phase="fold_round_1",
-        trace_id=trace_id,
-    )
+    try:
+        resp = await open_round(
+            client,
+            url,
+            payload,
+            headers,
+            payload_logger=payload_logger,
+            transport="http",
+            phase="fold_round_1",
+            trace_id=trace_id,
+        )
+    except httpx.HTTPError as exc:
+        return _http_upstream_transport_response(exc, trace_id=trace_id, started=started)
     if resp.status_code >= 400:
         err = await read_upstream_error(resp)
         await resp.aclose()

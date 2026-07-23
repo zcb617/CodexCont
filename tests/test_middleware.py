@@ -16,6 +16,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(ROOT))
@@ -898,6 +900,76 @@ def test_http_downstream_keeps_http_upstream():
     check("http downstream never opens upstream ws", not ws_calls, str(ws_calls))
 
 
+class _RaisingClient(FakeClient):
+    """HTTP client that fails before any upstream response is available."""
+
+    def __init__(self, exc: Exception):
+        super().__init__([])
+        self._exc = exc
+
+    async def send(self, req, stream=True):
+        raise self._exc
+
+
+def test_http_upstream_read_error_returns_502_without_asgi_crash():
+    """httpx.ReadError on open_round must become a normal 502 JSON response.
+
+    Regression: previously the exception escaped handle_responses and uvicorn
+    logged ``Exception in ASGI application`` with a full traceback.
+    """
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    failing = _RaisingClient(httpx.ReadError(""))
+
+    with TestClient(app, raise_server_exceptions=True) as client:
+        app.state.client = failing
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.5",
+                "stream": True,
+                "input": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    check("http read error returns 502", response.status_code == 502, str(response.status_code))
+    body = response.json()
+    err = body.get("error") if isinstance(body, dict) else None
+    check(
+        "http read error body is structured JSON",
+        isinstance(err, dict)
+        and err.get("code") == "upstream_transport_error"
+        and err.get("type") == "ReadError",
+        str(body),
+    )
+
+
+def test_http_upstream_timeout_returns_504():
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    failing = _RaisingClient(httpx.ReadTimeout("timed out"))
+
+    with TestClient(app, raise_server_exceptions=True) as client:
+        app.state.client = failing
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.5",
+                "stream": True,
+                "input": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    check("http timeout returns 504", response.status_code == 504, str(response.status_code))
+    body = response.json()
+    err = body.get("error") if isinstance(body, dict) else None
+    check(
+        "http timeout body names Timeout type",
+        isinstance(err, dict) and err.get("type") == "ReadTimeout",
+        str(body),
+    )
+
+
 def test_websocket_handshake_504_is_returned_without_crashing():
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
@@ -1425,6 +1497,8 @@ async def _main():
     await test_eof_incomplete()
     await test_native_upstream_websocket_reuses_connection()
     test_http_downstream_keeps_http_upstream()
+    test_http_upstream_read_error_returns_502_without_asgi_crash()
+    test_http_upstream_timeout_returns_504()
     test_websocket_handshake_504_is_returned_without_crashing()
     test_websocket_route_streams_events()
     await test_websocket_disconnect_cancels_waiting_upstream()
