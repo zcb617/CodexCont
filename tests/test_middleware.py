@@ -164,11 +164,14 @@ class FakeWsConnector:
         self.calls: list[dict] = []
         self.sessions: list[FakeWsSession] = []
 
-    async def __call__(self, *, url, headers, payload_logger, connection_id):
+    async def __call__(
+        self, *, url, headers, payload_logger, connection_id, timeout_cfg=None
+    ):
         self.calls.append({
             "url": url,
             "headers": dict(headers),
             "connection_id": connection_id,
+            "timeout_cfg": timeout_cfg,
         })
         session = FakeWsSession(self, url=url, payload_logger=payload_logger)
         self.sessions.append(session)
@@ -970,6 +973,30 @@ def test_http_upstream_timeout_returns_504():
     )
 
 
+def test_first_byte_timeout_policy_uses_serialized_body_size():
+    cfg = load_config(ROOT / "config.example.toml")
+    policy = cfg.timeouts
+    small = policy.small_body_max_bytes
+    large = policy.large_body_max_bytes
+
+    check(
+        "small request uses 60s first-byte budget",
+        proxy_module.first_byte_timeout_for_body(small, policy) == 60.0,
+        str(policy),
+    )
+    check(
+        "medium request uses 180s first-byte budget",
+        proxy_module.first_byte_timeout_for_body(small + 1, policy) == 180.0
+        and proxy_module.first_byte_timeout_for_body(large, policy) == 180.0,
+        str(policy),
+    )
+    check(
+        "large request uses 300s first-byte budget",
+        proxy_module.first_byte_timeout_for_body(large + 1, policy) == 300.0,
+        str(policy),
+    )
+
+
 async def test_first_byte_timeout_on_headers():
     """send() hanging past FIRST_BYTE_TIMEOUT_S becomes ReadTimeout."""
     old = proxy_module.FIRST_BYTE_TIMEOUT_S
@@ -1560,6 +1587,9 @@ async def test_upstream_diagnostic_logs_correlate_504():
           len(starts) == len(headers) == len(bodies) == 1, str(capture.messages))
     check("diagnostic logs correlate 504 with one request id",
           len(ids) == 3 and len(set(ids)) == 1 and ids[0] not in (None, "-"), str(ids))
+    check("diagnostic start log records selected timeout",
+          bool(starts) and "timeout_s=60.0" in starts[0],
+          starts[0] if starts else "missing")
     check("diagnostic headers log trace, status, elapsed, and upstream id",
           bool(headers)
           and "trace_id=trace_test_504" in headers[0]
@@ -1591,6 +1621,7 @@ async def _main():
     test_http_downstream_keeps_http_upstream()
     test_http_upstream_read_error_returns_502_without_asgi_crash()
     test_http_upstream_timeout_returns_504()
+    test_first_byte_timeout_policy_uses_serialized_body_size()
     await test_first_byte_timeout_on_headers()
     await test_first_byte_timeout_on_body_not_later_chunks()
     test_websocket_handshake_504_is_returned_without_crashing()

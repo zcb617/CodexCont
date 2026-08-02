@@ -314,6 +314,7 @@ async def _passthrough(
             transport="http",
             phase="passthrough",
             trace_id=trace_id,
+            timeout_cfg=cfg.timeouts,
         )
     except httpx.HTTPError as exc:
         return _http_upstream_transport_response(exc, trace_id=trace_id, started=t0)
@@ -416,6 +417,7 @@ async def handle_responses(request: Request) -> Response:
             transport="http",
             phase="fold_round_1",
             trace_id=trace_id,
+            timeout_cfg=cfg.timeouts,
         )
     except httpx.HTTPError as exc:
         return _http_upstream_transport_response(exc, trace_id=trace_id, started=started)
@@ -444,6 +446,7 @@ async def handle_responses(request: Request) -> Response:
             payload_logger=payload_logger,
             transport="http",
             trace_id=trace_id,
+            timeout_cfg=cfg.timeouts,
         ),
         media_type="text/event-stream",
     )
@@ -665,6 +668,7 @@ async def _process_responses_ws(
                     headers=headers,
                     payload_logger=payload_logger,
                     connection_id=connection_id,
+                    timeout_cfg=cfg.timeouts,
                 )
                 activity["upstream_session"] = upstream_session
 
@@ -756,6 +760,7 @@ async def _process_responses_ws(
                         transport="ws",
                         trace_id=trace_id,
                         round_opener=upstream_session.open_round,
+                        timeout_cfg=cfg.timeouts,
                     )
                 )
                 async for ev in event_iter:

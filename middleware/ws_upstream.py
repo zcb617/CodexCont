@@ -18,7 +18,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.client import connect as websockets_connect
 
-from .proxy import FIRST_BYTE_TIMEOUT_S, _remaining_first_byte_timeout
+from .config import TimeoutCfg
+from .proxy import (
+    _remaining_first_byte_timeout,
+    first_byte_timeout_for_body,
+)
 from .sse import serialize_event
 
 log = logging.getLogger("middleware.ws_upstream")
@@ -190,11 +194,13 @@ class UpstreamWebSocketSession:
         url: str,
         connection_id: str,
         payload_logger: Any | None = None,
+        timeout_cfg: TimeoutCfg | None = None,
     ) -> None:
         self._connection = connection
         self.url = url
         self.connection_id = connection_id
         self.payload_logger = payload_logger
+        self.timeout_cfg = timeout_cfg
         self._active: UpstreamWebSocketResponse | None = None
         self._closed = False
         response = getattr(connection, "response", None)
@@ -216,16 +222,20 @@ class UpstreamWebSocketSession:
         started = time.perf_counter()
         event = response_create_payload(payload)
         encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        encoded_bytes = len(encoded.encode("utf-8"))
+        timeout_s = first_byte_timeout_for_body(encoded_bytes, self.timeout_cfg)
         log.info(
             "event=upstream_request_start request_id=%s trace_id=%s transport=ws "
-            "phase=%s method=response.create url=%s model=%s input_items=%d body_bytes=%d",
+            "phase=%s method=response.create url=%s model=%s input_items=%d "
+            "body_bytes=%d timeout_s=%.1f",
             request_id,
             trace_id or "-",
             phase or "-",
             self.url,
             event.get("model") or "-",
             len(event.get("input") or []),
-            len(encoded.encode("utf-8")),
+            encoded_bytes,
+            timeout_s,
         )
 
         try:
@@ -236,7 +246,7 @@ class UpstreamWebSocketSession:
 
             first_event = await asyncio.wait_for(
                 _send_and_first_event(),
-                timeout=_remaining_first_byte_timeout(started),
+                timeout=_remaining_first_byte_timeout(started, timeout_s),
             )
         except asyncio.TimeoutError:
             log.warning(
@@ -246,11 +256,11 @@ class UpstreamWebSocketSession:
                 trace_id or "-",
                 phase or "-",
                 (time.perf_counter() - started) * 1000,
-                FIRST_BYTE_TIMEOUT_S,
+                timeout_s,
             )
             await self._drop_connection()
             raise UpstreamWebSocketError(
-                f"Upstream WebSocket first-event timeout after {FIRST_BYTE_TIMEOUT_S:.0f}s",
+                f"Upstream WebSocket first-event timeout after {timeout_s:.0f}s",
                 status_code=504,
             ) from None
         except asyncio.CancelledError:
@@ -380,6 +390,7 @@ async def connect_upstream_websocket(
     headers: dict[str, str],
     payload_logger: Any | None,
     connection_id: str,
+    timeout_cfg: TimeoutCfg | None = None,
     connector: WebSocketConnect = websockets_connect,
 ) -> UpstreamWebSocketSession:
     """Open the native upstream WS corresponding to an HTTP Responses URL."""
@@ -437,4 +448,5 @@ async def connect_upstream_websocket(
         url=ws_url,
         connection_id=connection_id,
         payload_logger=payload_logger,
+        timeout_cfg=timeout_cfg,
     )

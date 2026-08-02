@@ -27,7 +27,7 @@ from .codex import (
     should_continue,
     tier_n,
 )
-from .config import Config
+from .config import Config, TimeoutCfg
 from .sse import DONE, incremental_sse, serialize_done, serialize_event
 
 log = logging.getLogger("middleware.proxy")
@@ -36,6 +36,10 @@ log = logging.getLogger("middleware.proxy")
 # byte (headers + first chunk). After the first byte, the stream has no read
 # idle timeout — only this initial gate.
 FIRST_BYTE_TIMEOUT_S = 60.0
+FIRST_BYTE_TIMEOUT_MEDIUM_S = 180.0
+FIRST_BYTE_TIMEOUT_LARGE_S = 300.0
+FIRST_BYTE_SMALL_BODY_MAX_BYTES = 8 * 1024 * 1024
+FIRST_BYTE_LARGE_BODY_MAX_BYTES = 32 * 1024 * 1024
 
 _TERMINAL = ("response.completed", "response.failed", "response.incomplete")
 _USAGE_TOP = ("input_tokens", "output_tokens", "total_tokens")
@@ -51,14 +55,47 @@ _UPSTREAM_ID_HEADERS = (
 )
 
 
-def _remaining_first_byte_timeout(started: float) -> float:
+def first_byte_timeout_for_body(
+    body_bytes: int,
+    timeout_cfg: TimeoutCfg | None = None,
+) -> float:
+    """Return the first-byte budget for a serialized upstream request."""
+    if timeout_cfg is None:
+        small_body_max = FIRST_BYTE_SMALL_BODY_MAX_BYTES
+        large_body_max = FIRST_BYTE_LARGE_BODY_MAX_BYTES
+        small_timeout = FIRST_BYTE_TIMEOUT_S
+        medium_timeout = FIRST_BYTE_TIMEOUT_MEDIUM_S
+        large_timeout = FIRST_BYTE_TIMEOUT_LARGE_S
+    else:
+        small_body_max = timeout_cfg.small_body_max_bytes
+        large_body_max = timeout_cfg.large_body_max_bytes
+        small_timeout = timeout_cfg.small_timeout_s
+        medium_timeout = timeout_cfg.medium_timeout_s
+        large_timeout = timeout_cfg.large_timeout_s
+
+    if body_bytes <= small_body_max:
+        return small_timeout
+    if body_bytes <= large_body_max:
+        return medium_timeout
+    return large_timeout
+
+
+def _remaining_first_byte_timeout(
+    started: float,
+    timeout_s: float | None = None,
+) -> float:
     """Seconds left in the first-byte budget; never negative."""
-    return max(0.0, FIRST_BYTE_TIMEOUT_S - (time.perf_counter() - started))
+    budget = FIRST_BYTE_TIMEOUT_S if timeout_s is None else timeout_s
+    return max(0.0, budget - (time.perf_counter() - started))
 
 
-def _first_byte_timeout_error(started: float) -> httpx.ReadTimeout:
+def _first_byte_timeout_error(
+    started: float,
+    timeout_s: float | None = None,
+) -> httpx.ReadTimeout:
+    budget = FIRST_BYTE_TIMEOUT_S if timeout_s is None else timeout_s
     return httpx.ReadTimeout(
-        f"upstream first-byte timeout after {FIRST_BYTE_TIMEOUT_S:.0f}s "
+        f"upstream first-byte timeout after {budget:.0f}s "
         f"(elapsed_ms={_elapsed_ms(started):.2f})"
     )
 
@@ -100,16 +137,18 @@ async def _send_upstream_request(
     transport: str,
     phase: str,
     trace_id: str,
+    timeout_cfg: TimeoutCfg | None = None,
 ) -> httpx.Response:
     request_id = f"up_{uuid.uuid4().hex[:16]}"
     started = time.perf_counter()
+    timeout_s = first_byte_timeout_for_body(len(body), timeout_cfg)
     model = payload.get("model") if isinstance(payload, dict) else None
     input_items = len(payload.get("input") or []) if isinstance(payload, dict) else -1
     log.info(
         "event=upstream_request_start request_id=%s trace_id=%s transport=%s "
-        "phase=%s method=POST url=%s model=%s input_items=%d body_bytes=%d",
+        "phase=%s method=POST url=%s model=%s input_items=%d body_bytes=%d timeout_s=%.1f",
         request_id, trace_id or "-", transport or "-", phase or "-", url,
-        model or "-", input_items, len(body),
+        model or "-", input_items, len(body), timeout_s,
     )
 
     req = client.build_request("POST", url, content=body, headers=headers, timeout=None)
@@ -118,16 +157,16 @@ async def _send_upstream_request(
         # chunk is enforced in observed_response_bytes under the same deadline.
         response = await asyncio.wait_for(
             client.send(req, stream=True),
-            timeout=_remaining_first_byte_timeout(started),
+            timeout=_remaining_first_byte_timeout(started, timeout_s),
         )
     except asyncio.TimeoutError:
         log.warning(
             "event=upstream_first_byte_timeout request_id=%s trace_id=%s phase=%s "
             "elapsed_ms=%.2f stage=headers timeout_s=%.1f",
             request_id, trace_id or "-", phase or "-", _elapsed_ms(started),
-            FIRST_BYTE_TIMEOUT_S,
+            timeout_s,
         )
-        raise _first_byte_timeout_error(started) from None
+        raise _first_byte_timeout_error(started, timeout_s) from None
     except asyncio.CancelledError:
         log.warning(
             "event=upstream_request_cancelled request_id=%s trace_id=%s phase=%s "
@@ -150,7 +189,8 @@ async def _send_upstream_request(
         "transport": transport or "-",
         "phase": phase or "-",
         "started": started,
-        "first_byte_deadline": started + FIRST_BYTE_TIMEOUT_S,
+        "first_byte_deadline": started + timeout_s,
+        "first_byte_timeout_s": timeout_s,
     }
     setattr(response, _DIAG_ATTR, diag)
     log.info(
@@ -174,14 +214,16 @@ async def _send_upstream_request(
 async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
     """Yield an upstream body while logging first-byte and stream lifetime.
 
-    Enforces FIRST_BYTE_TIMEOUT_S only until the first body chunk arrives; the
-    remainder of the stream is untimed (no idle / total read timeout).
+    Enforces the selected first-byte budget only until the first body chunk
+    arrives; the remainder of the stream is untimed (no idle / total read
+    timeout).
     """
     diag = _response_diag(response)
     request_id = str(diag.get("request_id") or "-")
     trace_id = str(diag.get("trace_id") or "-")
     phase = str(diag.get("phase") or "-")
     started = float(diag.get("started") or time.perf_counter())
+    timeout_s = float(diag.get("first_byte_timeout_s") or FIRST_BYTE_TIMEOUT_S)
     total_bytes = 0
     reached_eof = False
     body_iter = response.aiter_bytes()
@@ -191,7 +233,7 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
         try:
             first_chunk = await asyncio.wait_for(
                 body_aiter.__anext__(),
-                timeout=_remaining_first_byte_timeout(started),
+                timeout=_remaining_first_byte_timeout(started, timeout_s),
             )
         except StopAsyncIteration:
             reached_eof = True
@@ -201,9 +243,9 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
                 "event=upstream_first_byte_timeout request_id=%s trace_id=%s phase=%s "
                 "elapsed_ms=%.2f stage=body timeout_s=%.1f body_bytes=%d",
                 request_id, trace_id, phase, _elapsed_ms(started),
-                FIRST_BYTE_TIMEOUT_S, total_bytes,
+                timeout_s, total_bytes,
             )
-            raise _first_byte_timeout_error(started) from None
+            raise _first_byte_timeout_error(started, timeout_s) from None
 
         total_bytes += len(first_chunk)
         log.info(
@@ -305,6 +347,7 @@ async def open_round(
     transport: str = "",
     phase: str = "",
     trace_id: str = "",
+    timeout_cfg: TimeoutCfg | None = None,
 ) -> httpx.Response:
     """Open a streaming upstream request (caller must aclose the response).
 
@@ -319,6 +362,7 @@ async def open_round(
         transport=transport,
         phase=phase,
         trace_id=trace_id,
+        timeout_cfg=timeout_cfg,
     )
 
 
@@ -332,6 +376,7 @@ async def open_passthrough(
     transport: str = "",
     phase: str = "",
     trace_id: str = "",
+    timeout_cfg: TimeoutCfg | None = None,
 ) -> httpx.Response:
     """Open a streaming upstream request forwarding the raw body unchanged."""
     try:
@@ -345,6 +390,7 @@ async def open_passthrough(
         transport=transport,
         phase=phase,
         trace_id=trace_id,
+        timeout_cfg=timeout_cfg,
     )
 
 
@@ -586,6 +632,7 @@ async def fold_stream(
     transport: str = "",
     trace_id: str = "",
     round_opener: Callable[..., Awaitable[Any]] | None = None,
+    timeout_cfg: TimeoutCfg | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield the folded downstream SSE byte stream. `first_response` is the
     already-opened (2xx) round-1 upstream response; later rounds are opened here
@@ -594,6 +641,7 @@ async def fold_stream(
     when repair_followup="stateful".
     """
     cont = cfg.cont
+    timeout_cfg = timeout_cfg or cfg.timeouts
     url = url or cfg.upstream.url
     orig_input = list(base_body.get("input") or [])
 
@@ -785,6 +833,7 @@ async def fold_stream(
                         transport=transport,
                         phase="continuation",
                         trace_id=trace_id,
+                        timeout_cfg=timeout_cfg,
                     )
                 if response.status_code >= 400:
                     body = (await read_upstream_error(response))[:2000]

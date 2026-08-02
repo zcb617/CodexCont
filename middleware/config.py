@@ -73,6 +73,15 @@ class LogCfg:
 
 
 @dataclass(frozen=True)
+class TimeoutCfg:
+    small_body_max_bytes: int = 8 * 1024 * 1024
+    large_body_max_bytes: int = 32 * 1024 * 1024
+    small_timeout_s: float = 60.0
+    medium_timeout_s: float = 180.0
+    large_timeout_s: float = 300.0
+
+
+@dataclass(frozen=True)
 class Config:
     server: ServerCfg = field(default_factory=ServerCfg)
     upstream: UpstreamCfg = field(default_factory=UpstreamCfg)
@@ -80,6 +89,7 @@ class Config:
     cont: ContinueCfg = field(default_factory=ContinueCfg)
     stream: StreamCfg = field(default_factory=StreamCfg)
     log: LogCfg = field(default_factory=LogCfg)
+    timeouts: TimeoutCfg = field(default_factory=TimeoutCfg)
     # Directory config.toml lived in (for resolving relative paths if needed).
     root: Path = field(default_factory=lambda: Path.cwd())
 
@@ -109,6 +119,7 @@ def load_config(path: str | Path) -> Config:
     cont = _section(data, "continue")
     stream = _section(data, "stream")
     log = _section(data, "log")
+    timeouts = _section(data, "timeouts")
 
     # listen_paths is a list in TOML; store as tuple.
     if "listen_paths" in server and isinstance(server["listen_paths"], list):
@@ -126,6 +137,7 @@ def load_config(path: str | Path) -> Config:
         cont=ContinueCfg(**_only_known(ContinueCfg, cont)),
         stream=StreamCfg(**_only_known(StreamCfg, stream)),
         log=LogCfg(**_only_known(LogCfg, log)),
+        timeouts=TimeoutCfg(**_only_known(TimeoutCfg, timeouts)),
         root=path.resolve().parent if path.exists() else Path.cwd(),
     )
 
