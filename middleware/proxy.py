@@ -32,14 +32,20 @@ from .sse import DONE, incremental_sse, serialize_done, serialize_event
 
 log = logging.getLogger("middleware.proxy")
 
-# Wall-clock budget from upstream request start until the first response body
-# byte (headers + first chunk). After the first byte, the stream has no read
-# idle timeout — only this initial gate.
+# Wall-clock budget from request start until the first final-output delta.
+# Metadata and reasoning summaries do not reset it; final-output chunks use a
+# reset-on-each-output idle budget.
 FIRST_BYTE_TIMEOUT_S = 60.0
 FIRST_BYTE_TIMEOUT_MEDIUM_S = 180.0
 FIRST_BYTE_TIMEOUT_LARGE_S = 300.0
 FIRST_BYTE_SMALL_BODY_MAX_BYTES = 8 * 1024 * 1024
 FIRST_BYTE_LARGE_BODY_MAX_BYTES = 32 * 1024 * 1024
+STREAM_IDLE_TIMEOUT_S = 5.0
+
+_STREAM_OUTPUT_DELTA_TYPES = frozenset({
+    "response.output_text.delta",
+    "response.function_call_arguments.delta",
+})
 
 _TERMINAL = ("response.completed", "response.failed", "response.incomplete")
 _USAGE_TOP = ("input_tokens", "output_tokens", "total_tokens")
@@ -53,6 +59,42 @@ _UPSTREAM_ID_HEADERS = (
     "server-timing",
     "retry-after",
 )
+
+
+class UpstreamStreamIdleTimeout(ConnectionError):
+    """No upstream stream data arrived within the configured idle budget."""
+
+    status_code = 504
+
+
+class UpstreamGenerationTimeout(ConnectionError):
+    """No final-output delta arrived within the size-based budget."""
+
+    status_code = 504
+
+
+def is_generation_delta_event(event: Any) -> bool:
+    """Return true only when continuous final output has started.
+
+    Reasoning-summary deltas are progress within the generation/thinking phase;
+    they must not switch the request from its size-based generation budget to
+    the much shorter stream-idle budget.
+    """
+    if not isinstance(event, dict):
+        return False
+    event_type = event.get("type")
+    return event_type in _STREAM_OUTPUT_DELTA_TYPES
+
+
+def _mark_generation_started(response: Any) -> None:
+    diag = _response_diag(response)
+    if not diag:
+        return
+    now = time.perf_counter()
+    if not diag.get("generation_started"):
+        diag["generation_started"] = True
+        diag["generation_started_at"] = now
+    diag["last_generation_at"] = now
 
 
 def first_byte_timeout_for_body(
@@ -138,10 +180,16 @@ async def _send_upstream_request(
     phase: str,
     trace_id: str,
     timeout_cfg: TimeoutCfg | None = None,
+    track_generation_start: bool = False,
 ) -> httpx.Response:
     request_id = f"up_{uuid.uuid4().hex[:16]}"
     started = time.perf_counter()
     timeout_s = first_byte_timeout_for_body(len(body), timeout_cfg)
+    stream_idle_timeout_s = (
+        timeout_cfg.stream_idle_timeout_s
+        if timeout_cfg is not None
+        else STREAM_IDLE_TIMEOUT_S
+    )
     model = payload.get("model") if isinstance(payload, dict) else None
     input_items = len(payload.get("input") or []) if isinstance(payload, dict) else -1
     log.info(
@@ -191,6 +239,10 @@ async def _send_upstream_request(
         "started": started,
         "first_byte_deadline": started + timeout_s,
         "first_byte_timeout_s": timeout_s,
+        "stream_idle_timeout_s": stream_idle_timeout_s,
+        "track_generation_start": track_generation_start,
+        "generation_started": not track_generation_start,
+        "last_generation_at": started if not track_generation_start else None,
     }
     setattr(response, _DIAG_ATTR, diag)
     log.info(
@@ -214,9 +266,8 @@ async def _send_upstream_request(
 async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
     """Yield an upstream body while logging first-byte and stream lifetime.
 
-    Enforces the selected first-byte budget only until the first body chunk
-    arrives; the remainder of the stream is untimed (no idle / total read
-    timeout).
+    Enforces the selected first-byte budget until the first body chunk arrives.
+    Every subsequent chunk resets an independent stream-idle budget.
     """
     diag = _response_diag(response)
     request_id = str(diag.get("request_id") or "-")
@@ -224,8 +275,12 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
     phase = str(diag.get("phase") or "-")
     started = float(diag.get("started") or time.perf_counter())
     timeout_s = float(diag.get("first_byte_timeout_s") or FIRST_BYTE_TIMEOUT_S)
+    stream_idle_timeout_s = float(
+        diag.get("stream_idle_timeout_s") or STREAM_IDLE_TIMEOUT_S
+    )
     total_bytes = 0
     reached_eof = False
+    outcome = "consumer_closed"
     body_iter = response.aiter_bytes()
     body_aiter = body_iter.__aiter__()
     try:
@@ -248,6 +303,8 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
             raise _first_byte_timeout_error(started, timeout_s) from None
 
         total_bytes += len(first_chunk)
+        if not diag.get("track_generation_start"):
+            diag["last_generation_at"] = time.perf_counter()
         log.info(
             "event=upstream_first_body_byte request_id=%s trace_id=%s "
             "phase=%s elapsed_ms=%.2f chunk_bytes=%d",
@@ -255,11 +312,61 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
         )
         yield first_chunk
 
-        # Subsequent chunks: no timeout (only first-byte is gated).
-        async for chunk in body_aiter:
+        # Metadata and reasoning summaries do not reset the size-based
+        # generation deadline. Once final output starts, each output delta
+        # resets the shorter idle budget.
+        while True:
+            generation_started = bool(diag.get("generation_started"))
+            if generation_started:
+                last_generation_at = float(
+                    diag.get("last_generation_at") or time.perf_counter()
+                )
+                read_timeout_s = max(
+                    0.0,
+                    stream_idle_timeout_s
+                    - (time.perf_counter() - last_generation_at),
+                )
+            else:
+                read_timeout_s = _remaining_first_byte_timeout(started, timeout_s)
+            try:
+                chunk = await asyncio.wait_for(
+                    body_aiter.__anext__(),
+                    timeout=read_timeout_s,
+                )
+            except StopAsyncIteration:
+                reached_eof = True
+                outcome = "eof"
+                break
+            except asyncio.TimeoutError:
+                if generation_started:
+                    outcome = "stream_idle_timeout"
+                    log.warning(
+                        "event=upstream_stream_idle_timeout request_id=%s "
+                        "trace_id=%s phase=%s elapsed_ms=%.2f "
+                        "stage=stream_idle idle_timeout_s=%.1f body_bytes=%d",
+                        request_id, trace_id, phase, _elapsed_ms(started),
+                        stream_idle_timeout_s, total_bytes,
+                    )
+                    raise UpstreamStreamIdleTimeout(
+                        "upstream stream idle timeout after "
+                        f"{stream_idle_timeout_s:.0f}s"
+                    ) from None
+                outcome = "generation_timeout"
+                log.warning(
+                    "event=upstream_generation_timeout request_id=%s "
+                    "trace_id=%s phase=%s elapsed_ms=%.2f "
+                    "stage=generation timeout_s=%.1f body_bytes=%d",
+                    request_id, trace_id, phase, _elapsed_ms(started),
+                    timeout_s, total_bytes,
+                )
+                raise UpstreamGenerationTimeout(
+                    "upstream generation timeout after "
+                    f"{timeout_s:.0f}s"
+                ) from None
             total_bytes += len(chunk)
+            if not diag.get("track_generation_start"):
+                diag["last_generation_at"] = time.perf_counter()
             yield chunk
-        reached_eof = True
     except asyncio.CancelledError:
         log.warning(
             "event=upstream_stream_cancelled request_id=%s trace_id=%s phase=%s "
@@ -289,7 +396,7 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
         log.info(
             "event=upstream_stream_end request_id=%s trace_id=%s phase=%s "
             "outcome=%s elapsed_ms=%.2f body_bytes=%d",
-            request_id, trace_id, phase, "eof" if reached_eof else "consumer_closed",
+            request_id, trace_id, phase, "eof" if reached_eof else outcome,
             _elapsed_ms(started), total_bytes,
         )
 
@@ -363,6 +470,7 @@ async def open_round(
         phase=phase,
         trace_id=trace_id,
         timeout_cfg=timeout_cfg,
+        track_generation_start=True,
     )
 
 
@@ -391,6 +499,7 @@ async def open_passthrough(
         phase=phase,
         trace_id=trace_id,
         timeout_cfg=timeout_cfg,
+        track_generation_start=False,
     )
 
 
@@ -681,6 +790,8 @@ async def fold_stream(
                 if not isinstance(ev, dict):
                     continue
                 t = ev.get("type", "")
+                if is_generation_delta_event(ev):
+                    _mark_generation_started(response)
 
                 # Lifecycle: emit one created+in_progress (round 1), swallow the rest.
                 if t in ("response.created", "response.in_progress"):
@@ -890,13 +1001,19 @@ async def fold_stream(
 
     except (httpx.HTTPError, ConnectionError) as exc:
         log.warning("upstream error mid-stream (round %d): %r", round_no, exc)
-        log.info("done: %d round(s) | %s | status=incomplete stop=upstream_error",
-                 round_no, _fmt_usage(total_usage))
+        if isinstance(exc, UpstreamStreamIdleTimeout):
+            stop_reason = "stream_idle_timeout"
+        elif isinstance(exc, UpstreamGenerationTimeout):
+            stop_reason = "generation_timeout"
+        else:
+            stop_reason = "upstream_error"
+        log.info("done: %d round(s) | %s | status=incomplete stop=%s",
+                 round_no, _fmt_usage(total_usage), stop_reason)
         yield serialize_event(
             _synthetic_incomplete(
                 base_response, final_output,
                 _agent_usage(first_usage, total_usage, None, flushed_final=False),
-                seq(), "upstream_error", rounds_info, total_usage)
+                seq(), stop_reason, rounds_info, total_usage)
         )
         return
     finally:

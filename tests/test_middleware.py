@@ -768,6 +768,96 @@ async def test_eof_incomplete():
           str([it.get("type") for it in out_items]))
 
 
+async def test_stream_idle_timeout_emits_incomplete_reason():
+    cfg = load_config(ROOT / "config.toml")
+    base_body = {"model": "gpt-5.5", "input": []}
+
+    class IdleFoldResponse(FakeResp):
+        async def aiter_bytes(self):
+            yield make_sse([
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp_idle", "status": "in_progress"},
+                },
+                {
+                "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "working",
+                },
+            ])
+            await asyncio.sleep(1.0)
+
+    response = IdleFoldResponse(b"")
+    setattr(response, proxy_module._DIAG_ATTR, {
+        "request_id": "up_fold_idle",
+        "trace_id": "trace_fold_idle",
+        "phase": "fold_round_1",
+        "started": __import__("time").perf_counter(),
+        "stream_idle_timeout_s": 0.05,
+    })
+    events = [
+        event for event in await run_fold(cfg, base_body, response, [])
+        if isinstance(event, dict)
+    ]
+    terminal = events[-1]
+    reason = (
+        ((terminal.get("response") or {}).get("incomplete_details") or {})
+        .get("reason")
+    )
+    check(
+        "stream idle timeout emits incomplete terminal",
+        terminal.get("type") == "response.incomplete",
+        str(terminal),
+    )
+    check(
+        "stream idle timeout emits specific reason",
+        reason == "stream_idle_timeout",
+        str(reason),
+    )
+
+    class MetadataOnlyResponse(FakeResp):
+        async def aiter_bytes(self):
+            yield make_sse([
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp_metadata", "status": "in_progress"},
+                },
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 0,
+                    "delta": "working",
+                },
+            ])
+            await asyncio.sleep(1.0)
+
+    metadata_response = MetadataOnlyResponse(b"")
+    setattr(metadata_response, proxy_module._DIAG_ATTR, {
+        "request_id": "up_fold_metadata",
+        "trace_id": "trace_fold_metadata",
+        "phase": "fold_round_1",
+        "started": __import__("time").perf_counter(),
+        "first_byte_timeout_s": 0.05,
+        "stream_idle_timeout_s": 0.01,
+        "generation_started": False,
+    })
+    metadata_events = [
+        event for event in await run_fold(
+            cfg, base_body, metadata_response, []
+        )
+        if isinstance(event, dict)
+    ]
+    metadata_terminal = metadata_events[-1]
+    metadata_reason = (
+        ((metadata_terminal.get("response") or {}).get("incomplete_details") or {})
+        .get("reason")
+    )
+    check(
+        "reasoning summary preserves generation timeout reason",
+        metadata_reason == "generation_timeout",
+        str(metadata_reason),
+    )
+
+
 async def test_native_upstream_websocket_reuses_connection():
     captured: dict = {}
 
@@ -870,6 +960,150 @@ async def test_native_upstream_websocket_reuses_connection():
     check("native ws preserves previous_response_id on later round",
           sent[1].get("previous_response_id") == "resp_one", str(sent[1]))
     check("native ws session closes its upstream connection", native.closed)
+
+
+async def test_native_upstream_websocket_stream_idle_timeout():
+    class IdleConnection:
+        def __init__(self, first_event):
+            self.response = SimpleNamespace(status_code=101, headers={})
+            self.recv_count = 0
+            self.closed = False
+            self.first_event = first_event
+
+        async def send(self, data):
+            pass
+
+        async def recv(self):
+            self.recv_count += 1
+            if self.recv_count == 1:
+                return json.dumps(self.first_event)
+            await asyncio.sleep(1.0)
+            raise AssertionError("idle receive should have timed out")
+
+        async def close(self):
+            self.closed = True
+
+    connection = IdleConnection({
+        "type": "response.output_text.delta",
+        "output_index": 0,
+        "delta": "started",
+    })
+
+    async def fake_connect(*args, **kwargs):
+        return connection
+
+    timeout_cfg = replace(
+        load_config(ROOT / "config.toml").timeouts,
+        stream_idle_timeout_s=0.05,
+    )
+    session = await connect_upstream_websocket(
+        url="https://example.test/v1/responses",
+        headers={},
+        payload_logger=None,
+        connection_id="ws_idle_test",
+        timeout_cfg=timeout_cfg,
+        connector=fake_connect,
+    )
+    response = await session.open_round(
+        {"model": "gpt-5.5", "input": []},
+        phase="fold_round_1",
+        trace_id="trace_ws_idle",
+    )
+    raised = None
+    try:
+        async for _ in response.aiter_events():
+            pass
+    except Exception as exc:
+        raised = exc
+    check(
+        "native websocket silence raises stream idle timeout",
+        isinstance(raised, proxy_module.UpstreamStreamIdleTimeout),
+        repr(raised),
+    )
+    check(
+        "native websocket idle timeout closes upstream connection",
+        connection.closed,
+    )
+
+    metadata_connection = IdleConnection({
+        "type": "response.reasoning_summary_text.delta",
+        "output_index": 0,
+        "delta": "working",
+    })
+
+    async def metadata_connect(*args, **kwargs):
+        return metadata_connection
+
+    metadata_timeout_cfg = replace(
+        timeout_cfg,
+        small_timeout_s=0.05,
+    )
+    metadata_session = await connect_upstream_websocket(
+        url="https://example.test/v1/responses",
+        headers={},
+        payload_logger=None,
+        connection_id="ws_metadata_test",
+        timeout_cfg=metadata_timeout_cfg,
+        connector=metadata_connect,
+    )
+    metadata_response = await metadata_session.open_round(
+        {"model": "gpt-5.5", "input": []},
+        phase="fold_round_1",
+        trace_id="trace_ws_metadata",
+    )
+    raised = None
+    try:
+        async for _ in metadata_response.aiter_events():
+            pass
+    except Exception as exc:
+        raised = exc
+    check(
+        "websocket reasoning summary stays in generation timeout budget",
+        isinstance(raised, proxy_module.UpstreamGenerationTimeout),
+        repr(raised),
+    )
+
+    class KeepaliveConnection(IdleConnection):
+        async def recv(self):
+            self.recv_count += 1
+            if self.recv_count == 1:
+                return json.dumps(self.first_event)
+            await asyncio.sleep(0.02)
+            return json.dumps({"type": "keepalive"})
+
+    keepalive_connection = KeepaliveConnection({
+        "type": "response.output_text.delta",
+        "output_index": 0,
+        "delta": "started",
+    })
+
+    async def keepalive_connect(*args, **kwargs):
+        return keepalive_connection
+
+    keepalive_session = await connect_upstream_websocket(
+        url="https://example.test/v1/responses",
+        headers={},
+        payload_logger=None,
+        connection_id="ws_keepalive_test",
+        timeout_cfg=timeout_cfg,
+        connector=keepalive_connect,
+    )
+    keepalive_response = await keepalive_session.open_round(
+        {"model": "gpt-5.5", "input": []},
+        phase="fold_round_1",
+        trace_id="trace_ws_keepalive",
+    )
+    raised = None
+    try:
+        async for _ in keepalive_response.aiter_events():
+            pass
+    except Exception as exc:
+        raised = exc
+    check(
+        "websocket keepalives do not reset active generation idle budget",
+        isinstance(raised, proxy_module.UpstreamStreamIdleTimeout),
+        repr(raised),
+    )
 
 
 def test_http_downstream_keeps_http_upstream():
@@ -995,6 +1229,31 @@ def test_first_byte_timeout_policy_uses_serialized_body_size():
         proxy_module.first_byte_timeout_for_body(large + 1, policy) == 300.0,
         str(policy),
     )
+    check(
+        "stream idle timeout defaults to 5s",
+        policy.stream_idle_timeout_s == 5.0,
+        str(policy),
+    )
+    check(
+        "metadata events do not count as model generation",
+        not proxy_module.is_generation_delta_event({"type": "codex.rate_limits"})
+        and not proxy_module.is_generation_delta_event({"type": "response.created"}),
+    )
+    check(
+        "reasoning summary stays in generation budget",
+        not proxy_module.is_generation_delta_event({
+            "type": "response.reasoning_summary_text.delta"
+        }),
+    )
+    check(
+        "final output deltas start active stream phase",
+        proxy_module.is_generation_delta_event({
+            "type": "response.output_text.delta"
+        })
+        and proxy_module.is_generation_delta_event({
+            "type": "response.function_call_arguments.delta"
+        }),
+    )
 
 
 async def test_first_byte_timeout_on_headers():
@@ -1032,8 +1291,8 @@ async def test_first_byte_timeout_on_headers():
     )
 
 
-async def test_first_byte_timeout_on_body_not_later_chunks():
-    """Only the first body chunk is timed; later chunks may idle freely."""
+async def test_first_byte_and_stream_idle_timeouts():
+    """First-byte and reset-on-each-chunk idle budgets are independent."""
     old = proxy_module.FIRST_BYTE_TIMEOUT_S
     proxy_module.FIRST_BYTE_TIMEOUT_S = 0.05
 
@@ -1045,18 +1304,38 @@ async def test_first_byte_timeout_on_body_not_later_chunks():
     class IdleAfterFirst(FakeResp):
         async def aiter_bytes(self):
             yield b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
-            await asyncio.sleep(0.2)  # > FIRST_BYTE_TIMEOUT_S, must NOT time out
+            await asyncio.sleep(0.2)
             yield b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
 
-    try:
-        # Slow first chunk → timeout
-        slow = SlowFirstChunk(b"")
-        setattr(slow, proxy_module._DIAG_ATTR, {
-            "request_id": "up_slow",
-            "trace_id": "t1",
+    class DeltaThenIdle(FakeResp):
+        async def aiter_bytes(self):
+            yield b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\"}\n\n"
+            await asyncio.sleep(0.2)
+            yield b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"b\"}\n\n"
+
+    class ContinuouslyActive(FakeResp):
+        async def aiter_bytes(self):
+            for index in range(4):
+                await asyncio.sleep(0.02)
+                yield (
+                    "data: {\"type\":\"response.output_text.delta\","
+                    f"\"delta\":\"{index}\"}}\n\n"
+                ).encode()
+
+    def diagnostics(trace_id: str, *, idle_timeout_s: float = 0.05):
+        return {
+            "request_id": f"up_{trace_id}",
+            "trace_id": trace_id,
             "phase": "fold_round_1",
             "started": __import__("time").perf_counter(),
-        })
+            "first_byte_timeout_s": 0.05,
+            "stream_idle_timeout_s": idle_timeout_s,
+            "generation_started": False,
+        }
+
+    try:
+        slow = SlowFirstChunk(b"")
+        setattr(slow, proxy_module._DIAG_ATTR, diagnostics("slow"))
         raised = None
         try:
             async for _ in proxy_module.observed_response_bytes(slow):
@@ -1069,20 +1348,54 @@ async def test_first_byte_timeout_on_body_not_later_chunks():
             repr(raised),
         )
 
-        # First chunk immediate, idle later → success
         idle = IdleAfterFirst(b"")
-        setattr(idle, proxy_module._DIAG_ATTR, {
-            "request_id": "up_idle",
-            "trace_id": "t2",
-            "phase": "fold_round_1",
-            "started": __import__("time").perf_counter(),
-        })
-        chunks = []
-        async for c in proxy_module.observed_response_bytes(idle):
-            chunks.append(c)
+        setattr(idle, proxy_module._DIAG_ATTR, diagnostics("idle"))
+        raised = None
+        try:
+            async for _ in proxy_module.observed_response_bytes(idle):
+                pass
+        except Exception as exc:
+            raised = exc
         check(
-            "post-first-byte idle is allowed",
-            len(chunks) == 2 and b"response.completed" in chunks[1],
+            "metadata does not end generation timeout budget",
+            isinstance(raised, proxy_module.UpstreamGenerationTimeout),
+            repr(raised),
+        )
+
+        delta_idle = DeltaThenIdle(b"")
+        delta_diag = diagnostics("delta_idle")
+        setattr(delta_idle, proxy_module._DIAG_ATTR, delta_diag)
+        delta_iter = proxy_module.observed_response_bytes(delta_idle).__aiter__()
+        await delta_iter.__anext__()
+        delta_diag["generation_started"] = True
+        delta_diag["last_generation_at"] = __import__("time").perf_counter()
+        raised = None
+        try:
+            await delta_iter.__anext__()
+        except Exception as exc:
+            raised = exc
+        check(
+            "post-generation silence raises stream idle timeout",
+            isinstance(raised, proxy_module.UpstreamStreamIdleTimeout),
+            repr(raised),
+        )
+
+        active = ContinuouslyActive(b"")
+        active_diag = diagnostics("active")
+        setattr(active, proxy_module._DIAG_ATTR, active_diag)
+        active_iter = proxy_module.observed_response_bytes(active).__aiter__()
+        chunks = [await active_iter.__anext__()]
+        proxy_module._mark_generation_started(active)
+        while True:
+            try:
+                chunk = await active_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            chunks.append(chunk)
+            proxy_module._mark_generation_started(active)
+        check(
+            "active stream resets idle timeout after each chunk",
+            len(chunks) == 4,
             str(chunks),
         )
     finally:
@@ -1617,13 +1930,15 @@ async def _main():
     test_reasoning_gate()
     test_stateful_repair()
     await test_eof_incomplete()
+    await test_stream_idle_timeout_emits_incomplete_reason()
     await test_native_upstream_websocket_reuses_connection()
+    await test_native_upstream_websocket_stream_idle_timeout()
     test_http_downstream_keeps_http_upstream()
     test_http_upstream_read_error_returns_502_without_asgi_crash()
     test_http_upstream_timeout_returns_504()
     test_first_byte_timeout_policy_uses_serialized_body_size()
     await test_first_byte_timeout_on_headers()
-    await test_first_byte_timeout_on_body_not_later_chunks()
+    await test_first_byte_and_stream_idle_timeouts()
     test_websocket_handshake_504_is_returned_without_crashing()
     test_websocket_route_streams_events()
     await test_websocket_disconnect_cancels_waiting_upstream()

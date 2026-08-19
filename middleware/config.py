@@ -79,6 +79,7 @@ class TimeoutCfg:
     small_timeout_s: float = 60.0
     medium_timeout_s: float = 180.0
     large_timeout_s: float = 300.0
+    stream_idle_timeout_s: float = 5.0
 
 
 @dataclass(frozen=True)

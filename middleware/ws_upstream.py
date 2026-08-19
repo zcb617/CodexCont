@@ -20,8 +20,12 @@ from websockets.asyncio.client import connect as websockets_connect
 
 from .config import TimeoutCfg
 from .proxy import (
+    STREAM_IDLE_TIMEOUT_S,
+    UpstreamGenerationTimeout,
+    UpstreamStreamIdleTimeout,
     _remaining_first_byte_timeout,
     first_byte_timeout_for_body,
+    is_generation_delta_event,
 )
 from .sse import serialize_event
 
@@ -131,6 +135,12 @@ class UpstreamWebSocketResponse:
         self._first_event: dict[str, Any] | None = first_event
         self._consumed = False
         self._closed = False
+        self._generation_started = is_generation_delta_event(first_event)
+        diagnostics["generation_started"] = self._generation_started
+        if self._generation_started:
+            now = time.perf_counter()
+            diagnostics["generation_started_at"] = now
+            diagnostics["last_generation_at"] = now
         self._terminal_received = first_event.get("type") in _TERMINAL_EVENTS
         self.status_code = (
             _error_status(first_event) if first_event.get("type") == "error" else 200
@@ -146,6 +156,13 @@ class UpstreamWebSocketResponse:
         event = self._first_event
         self._first_event = None
         while event is not None:
+            if is_generation_delta_event(event):
+                self._generation_started = True
+                diagnostics = getattr(self, _DIAG_ATTR, {})
+                now = time.perf_counter()
+                diagnostics["generation_started"] = True
+                diagnostics.setdefault("generation_started_at", now)
+                diagnostics["last_generation_at"] = now
             terminal = event.get("type") in _TERMINAL_EVENTS
             if terminal:
                 self._terminal_received = True
@@ -201,6 +218,11 @@ class UpstreamWebSocketSession:
         self.connection_id = connection_id
         self.payload_logger = payload_logger
         self.timeout_cfg = timeout_cfg
+        self.stream_idle_timeout_s = (
+            timeout_cfg.stream_idle_timeout_s
+            if timeout_cfg is not None
+            else STREAM_IDLE_TIMEOUT_S
+        )
         self._active: UpstreamWebSocketResponse | None = None
         self._closed = False
         response = getattr(connection, "response", None)
@@ -300,6 +322,8 @@ class UpstreamWebSocketSession:
             "transport": "ws",
             "phase": phase or "-",
             "started": started,
+            "first_byte_timeout_s": timeout_s,
+            "stream_idle_timeout_s": self.stream_idle_timeout_s,
         }
         response = UpstreamWebSocketResponse(
             self, first_event, diagnostics=diagnostics
@@ -348,13 +372,67 @@ class UpstreamWebSocketSession:
     ) -> dict[str, Any]:
         if self._active is not response:
             raise UpstreamWebSocketError("Upstream WebSocket response is no longer active")
+        diag = getattr(response, _DIAG_ATTR, {})
+        started = float(diag.get("started") or time.perf_counter())
+        generation_timeout_s = float(diag.get("first_byte_timeout_s") or 60.0)
+        generation_started = response._generation_started
+        if generation_started:
+            last_generation_at = float(
+                diag.get("last_generation_at") or time.perf_counter()
+            )
+            receive_timeout_s = max(
+                0.0,
+                self.stream_idle_timeout_s
+                - (time.perf_counter() - last_generation_at),
+            )
+        else:
+            receive_timeout_s = _remaining_first_byte_timeout(
+                started, generation_timeout_s
+            )
         try:
-            return await self._receive_json()
+            return await asyncio.wait_for(
+                self._receive_json(),
+                timeout=receive_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            await self._drop_connection()
+            if generation_started:
+                log.warning(
+                    "event=upstream_stream_idle_timeout request_id=%s "
+                    "trace_id=%s phase=%s elapsed_ms=%.2f "
+                    "stage=stream_idle idle_timeout_s=%.1f",
+                    diag.get("request_id") or "-",
+                    diag.get("trace_id") or "-",
+                    diag.get("phase") or "-",
+                    (time.perf_counter() - started) * 1000,
+                    self.stream_idle_timeout_s,
+                )
+                raise UpstreamStreamIdleTimeout(
+                    "upstream WebSocket stream idle timeout after "
+                    f"{self.stream_idle_timeout_s:.0f}s"
+                ) from None
+            log.warning(
+                "event=upstream_generation_timeout request_id=%s trace_id=%s "
+                "phase=%s elapsed_ms=%.2f stage=generation timeout_s=%.1f",
+                diag.get("request_id") or "-",
+                diag.get("trace_id") or "-",
+                diag.get("phase") or "-",
+                (time.perf_counter() - started) * 1000,
+                generation_timeout_s,
+            )
+            raise UpstreamGenerationTimeout(
+                "upstream WebSocket generation timeout after "
+                f"{generation_timeout_s:.0f}s"
+            ) from None
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await self._drop_connection()
-            if isinstance(exc, UpstreamWebSocketError):
+            if isinstance(
+                exc,
+                (UpstreamWebSocketError, UpstreamGenerationTimeout,
+                 UpstreamStreamIdleTimeout),
+            ):
                 raise
             raise UpstreamWebSocketError("Upstream WebSocket receive failed") from exc
 
