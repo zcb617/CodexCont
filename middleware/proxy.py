@@ -45,6 +45,7 @@ STREAM_IDLE_TIMEOUT_S = 5.0
 _STREAM_OUTPUT_DELTA_TYPES = frozenset({
     "response.output_text.delta",
     "response.function_call_arguments.delta",
+    "response.custom_tool_call_input.delta",
 })
 _REASONING_DELTA_TYPES = frozenset({
     "response.reasoning_summary_text.delta",
@@ -113,6 +114,7 @@ def _record_upstream_event(response: Any, event: Any) -> None:
         event_type = "-"
     now_mono = time.perf_counter()
     now_wall = time.time()
+    stream_was_started = bool(diag.get("generation_started"))
     diag["last_event_type"] = event_type
     diag["last_event_at"] = now_wall
     diag["last_event_monotonic"] = now_mono
@@ -120,6 +122,12 @@ def _record_upstream_event(response: Any, event: Any) -> None:
     if isinstance(recent, list):
         recent.append(event_type)
         del recent[:-_RECENT_EVENT_TYPES_LIMIT]
+
+    # The whitelist is used only to enter the streaming phase. Once entered,
+    # every upstream event proves the stream is active and resets its idle
+    # deadline, regardless of event type.
+    if stream_was_started:
+        diag["last_generation_at"] = now_mono
 
     if event_type in _REASONING_DELTA_TYPES:
         diag["last_reasoning_delta_at"] = now_wall

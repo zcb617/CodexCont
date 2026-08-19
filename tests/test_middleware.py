@@ -857,6 +857,55 @@ async def test_stream_idle_timeout_emits_incomplete_reason():
         str(metadata_reason),
     )
 
+    class ActiveCustomToolResponse(FakeResp):
+        async def aiter_bytes(self):
+            yield make_sse([
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp_active", "status": "in_progress"},
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "started",
+                },
+            ])
+            for index in range(4):
+                await asyncio.sleep(0.02)
+                yield make_sse([{
+                    "type": "response.custom_tool_call_input.delta",
+                    "output_index": 1,
+                    "delta": str(index),
+                }])
+            yield make_sse([{
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_active",
+                    "status": "completed",
+                    "output": [],
+                },
+            }])
+
+    active_response = ActiveCustomToolResponse(b"")
+    setattr(active_response, proxy_module._DIAG_ATTR, {
+        "request_id": "up_fold_active_custom_tool",
+        "trace_id": "trace_fold_active_custom_tool",
+        "phase": "fold_round_1",
+        "started": __import__("time").perf_counter(),
+        "first_byte_timeout_s": 0.2,
+        "stream_idle_timeout_s": 0.05,
+        "generation_started": False,
+    })
+    active_events = [
+        event for event in await run_fold(cfg, base_body, active_response, [])
+        if isinstance(event, dict)
+    ]
+    check(
+        "HTTP custom-tool events reset active stream idle budget",
+        active_events[-1].get("type") == "response.completed",
+        str(active_events[-1]),
+    )
+
 
 async def test_native_upstream_websocket_reuses_connection():
     captured: dict = {}
@@ -1069,7 +1118,12 @@ async def test_native_upstream_websocket_stream_idle_timeout():
             if self.recv_count == 1:
                 return json.dumps(self.first_event)
             await asyncio.sleep(0.02)
-            return json.dumps({"type": "keepalive"})
+            if self.recv_count < 6:
+                return json.dumps({"type": "keepalive"})
+            return json.dumps({
+                "type": "response.completed",
+                "response": {"id": "resp_keepalive", "status": "completed"},
+            })
 
     keepalive_connection = KeepaliveConnection({
         "type": "response.output_text.delta",
@@ -1100,8 +1154,8 @@ async def test_native_upstream_websocket_stream_idle_timeout():
     except Exception as exc:
         raised = exc
     check(
-        "websocket keepalives do not reset active generation idle budget",
-        isinstance(raised, proxy_module.UpstreamStreamIdleTimeout),
+        "websocket events reset active stream idle budget",
+        raised is None,
         repr(raised),
     )
 
@@ -1252,6 +1306,9 @@ def test_first_byte_timeout_policy_uses_serialized_body_size():
         })
         and proxy_module.is_generation_delta_event({
             "type": "response.function_call_arguments.delta"
+        })
+        and proxy_module.is_generation_delta_event({
+            "type": "response.custom_tool_call_input.delta"
         }),
     )
 
@@ -1267,6 +1324,8 @@ def test_first_byte_timeout_policy_uses_serialized_body_size():
         {"type": "response.reasoning_summary_text.delta", "delta": "thinking"},
         {"type": "response.output_text.delta", "delta": "answer"},
         {"type": "response.function_call_arguments.delta", "delta": "{}"},
+        {"type": "response.custom_tool_call_input.delta", "delta": "input"},
+        {"type": "response.output_item.done"},
     ):
         proxy_module._record_upstream_event(diagnostic_response, event)
     timeout_diag = proxy_module._timeout_event_diagnostics(
@@ -1293,11 +1352,13 @@ def test_first_byte_timeout_policy_uses_serialized_body_size():
     check(
         "timeout diagnostics record reasoning and final output events",
         timeout_diag["last_event_type"]
-        == "response.function_call_arguments.delta"
+        == "response.output_item.done"
         and timeout_diag["last_output_delta_type"]
-        == "response.function_call_arguments.delta"
+        == "response.custom_tool_call_input.delta"
         and timeout_diag["reasoning_delta_count"] == 1
-        and timeout_diag["output_delta_count"] == 2
+        and timeout_diag["output_delta_count"] == 3
+        and diagnostic_state["last_generation_at"]
+        > diagnostic_state["last_output_delta_monotonic"]
         and "response.reasoning_summary_text.delta"
         in timeout_diag["recent_event_types"],
         str(timeout_diag),
