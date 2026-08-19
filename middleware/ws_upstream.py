@@ -23,6 +23,7 @@ from .proxy import (
     STREAM_IDLE_TIMEOUT_S,
     UpstreamGenerationTimeout,
     UpstreamStreamIdleTimeout,
+    _record_upstream_chunk,
     _record_upstream_event,
     _remaining_first_byte_timeout,
     _timeout_event_diagnostics,
@@ -223,6 +224,7 @@ class UpstreamWebSocketSession:
         )
         self._active: UpstreamWebSocketResponse | None = None
         self._closed = False
+        self._last_receive_size = 0
         response = getattr(connection, "response", None)
         self.response_headers = getattr(response, "headers", {}) or {}
 
@@ -327,6 +329,7 @@ class UpstreamWebSocketSession:
             self, first_event, diagnostics=diagnostics
         )
         self._active = response
+        _record_upstream_chunk(response, self._last_receive_size)
         log.info(
             "event=upstream_response_first_event request_id=%s trace_id=%s phase=%s "
             "status=%s event_type=%s elapsed_ms=%.2f",
@@ -352,7 +355,12 @@ class UpstreamWebSocketSession:
             raise UpstreamWebSocketError("Upstream WebSocket connection is closed")
         raw = await self._connection.recv()
         if isinstance(raw, bytes):
+            self._last_receive_size = len(raw)
             raw = raw.decode("utf-8")
+        elif isinstance(raw, str):
+            self._last_receive_size = len(raw.encode("utf-8"))
+        else:
+            self._last_receive_size = 0
         try:
             event = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
@@ -388,10 +396,12 @@ class UpstreamWebSocketSession:
                 started, generation_timeout_s
             )
         try:
-            return await asyncio.wait_for(
+            event = await asyncio.wait_for(
                 self._receive_json(),
                 timeout=receive_timeout_s,
             )
+            _record_upstream_chunk(response, self._last_receive_size)
+            return event
         except asyncio.TimeoutError:
             await self._drop_connection()
             if generation_started:
@@ -406,6 +416,9 @@ class UpstreamWebSocketSession:
                     "last_reasoning_delta_at=%.3f last_output_delta_type=%s "
                     "last_output_delta_at=%.3f reasoning_delta_count=%d "
                     "output_delta_count=%d ms_since_last_output_delta=%.2f "
+                    "last_raw_chunk_at=%.3f raw_chunk_count=%d "
+                    "last_raw_chunk_bytes=%d ms_since_last_raw_chunk=%.2f "
+                    "raw_bytes_since_last_event=%d "
                     "generation_elapsed_ms=%.2f recent_event_types=%s",
                     diag.get("request_id") or "-",
                     diag.get("trace_id") or "-",
@@ -421,6 +434,11 @@ class UpstreamWebSocketSession:
                     timeout_diag["reasoning_delta_count"],
                     timeout_diag["output_delta_count"],
                     timeout_diag["ms_since_last_output_delta"],
+                    timeout_diag["last_raw_chunk_at"],
+                    timeout_diag["raw_chunk_count"],
+                    timeout_diag["last_raw_chunk_bytes"],
+                    timeout_diag["ms_since_last_raw_chunk"],
+                    timeout_diag["raw_bytes_since_last_event"],
                     timeout_diag["generation_elapsed_ms"],
                     timeout_diag["recent_event_types"],
                 )
@@ -438,6 +456,9 @@ class UpstreamWebSocketSession:
                 "last_reasoning_delta_at=%.3f last_output_delta_type=%s "
                 "last_output_delta_at=%.3f reasoning_delta_count=%d "
                 "output_delta_count=%d ms_since_last_output_delta=%.2f "
+                "last_raw_chunk_at=%.3f raw_chunk_count=%d "
+                "last_raw_chunk_bytes=%d ms_since_last_raw_chunk=%.2f "
+                "raw_bytes_since_last_event=%d "
                 "generation_elapsed_ms=%.2f recent_event_types=%s",
                 diag.get("request_id") or "-",
                 diag.get("trace_id") or "-",
@@ -453,6 +474,11 @@ class UpstreamWebSocketSession:
                 timeout_diag["reasoning_delta_count"],
                 timeout_diag["output_delta_count"],
                 timeout_diag["ms_since_last_output_delta"],
+                timeout_diag["last_raw_chunk_at"],
+                timeout_diag["raw_chunk_count"],
+                timeout_diag["last_raw_chunk_bytes"],
+                timeout_diag["ms_since_last_raw_chunk"],
+                timeout_diag["raw_bytes_since_last_event"],
                 timeout_diag["generation_elapsed_ms"],
                 timeout_diag["recent_event_types"],
             )

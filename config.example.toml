@@ -52,8 +52,8 @@ rechunk_size = 16
 [timeouts]
 # Model-generation deadline selected from serialized request size. Metadata
 # events such as rate limits/created do not end or reset this budget.
-small_body_max_bytes = 8388608       # 8 MiB
-large_body_max_bytes = 33554432      # 32 MiB
+small_body_max_bytes = 524288        # 512 KiB
+large_body_max_bytes = 1048576       # 1 MiB
 small_timeout_s = 60.0
 medium_timeout_s = 180.0
 large_timeout_s = 300.0              # hard upper tier for very large contexts

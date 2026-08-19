@@ -102,6 +102,21 @@ def _mark_generation_started(response: Any) -> None:
     diag["last_generation_at"] = now
 
 
+def _record_upstream_chunk(response: Any, chunk_bytes: int) -> None:
+    """Record raw transport activity before SSE framing/parsing."""
+    diag = _response_diag(response)
+    if not diag:
+        return
+    now_mono = time.perf_counter()
+    diag["last_raw_chunk_at"] = time.time()
+    diag["last_raw_chunk_monotonic"] = now_mono
+    diag["last_raw_chunk_bytes"] = max(0, int(chunk_bytes))
+    diag["raw_chunk_count"] = int(diag.get("raw_chunk_count") or 0) + 1
+    diag["raw_bytes_since_last_event"] = int(
+        diag.get("raw_bytes_since_last_event") or 0
+    ) + max(0, int(chunk_bytes))
+
+
 def _record_upstream_event(response: Any, event: Any) -> None:
     """Record compact event diagnostics shared by HTTP and WebSocket paths."""
     if not isinstance(event, dict):
@@ -118,6 +133,7 @@ def _record_upstream_event(response: Any, event: Any) -> None:
     diag["last_event_type"] = event_type
     diag["last_event_at"] = now_wall
     diag["last_event_monotonic"] = now_mono
+    diag["raw_bytes_since_last_event"] = 0
     recent = diag.setdefault("recent_event_types", [])
     if isinstance(recent, list):
         recent.append(event_type)
@@ -153,6 +169,12 @@ def _timeout_event_diagnostics(
     ms_since_last_output = (
         (now - float(last_output)) * 1000 if last_output is not None else -1.0
     )
+    last_raw_chunk = diag.get("last_raw_chunk_monotonic")
+    ms_since_last_raw_chunk = (
+        (now - float(last_raw_chunk)) * 1000
+        if last_raw_chunk is not None
+        else -1.0
+    )
     recent = diag.get("recent_event_types")
     return {
         "timeout_phase": timeout_phase,
@@ -168,6 +190,13 @@ def _timeout_event_diagnostics(
         "reasoning_delta_count": int(diag.get("reasoning_delta_count") or 0),
         "output_delta_count": int(diag.get("output_delta_count") or 0),
         "ms_since_last_output_delta": ms_since_last_output,
+        "last_raw_chunk_at": float(diag.get("last_raw_chunk_at") or 0.0),
+        "raw_chunk_count": int(diag.get("raw_chunk_count") or 0),
+        "last_raw_chunk_bytes": int(diag.get("last_raw_chunk_bytes") or 0),
+        "ms_since_last_raw_chunk": ms_since_last_raw_chunk,
+        "raw_bytes_since_last_event": int(
+            diag.get("raw_bytes_since_last_event") or 0
+        ),
         "generation_elapsed_ms": (now - started) * 1000,
         "recent_event_types": ">".join(recent) if isinstance(recent, list) else "-",
     }
@@ -379,6 +408,7 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
             raise _first_byte_timeout_error(started, timeout_s) from None
 
         total_bytes += len(first_chunk)
+        _record_upstream_chunk(response, len(first_chunk))
         if not diag.get("track_generation_start"):
             diag["last_generation_at"] = time.perf_counter()
         log.info(
@@ -427,6 +457,9 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
                         "last_reasoning_delta_at=%.3f last_output_delta_type=%s "
                         "last_output_delta_at=%.3f reasoning_delta_count=%d "
                         "output_delta_count=%d ms_since_last_output_delta=%.2f "
+                        "last_raw_chunk_at=%.3f raw_chunk_count=%d "
+                        "last_raw_chunk_bytes=%d ms_since_last_raw_chunk=%.2f "
+                        "raw_bytes_since_last_event=%d "
                         "generation_elapsed_ms=%.2f recent_event_types=%s",
                         request_id, trace_id, phase, _elapsed_ms(started),
                         stream_idle_timeout_s, total_bytes,
@@ -439,6 +472,11 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
                         timeout_diag["reasoning_delta_count"],
                         timeout_diag["output_delta_count"],
                         timeout_diag["ms_since_last_output_delta"],
+                        timeout_diag["last_raw_chunk_at"],
+                        timeout_diag["raw_chunk_count"],
+                        timeout_diag["last_raw_chunk_bytes"],
+                        timeout_diag["ms_since_last_raw_chunk"],
+                        timeout_diag["raw_bytes_since_last_event"],
                         timeout_diag["generation_elapsed_ms"],
                         timeout_diag["recent_event_types"],
                     )
@@ -458,6 +496,9 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
                     "last_reasoning_delta_at=%.3f last_output_delta_type=%s "
                     "last_output_delta_at=%.3f reasoning_delta_count=%d "
                     "output_delta_count=%d ms_since_last_output_delta=%.2f "
+                    "last_raw_chunk_at=%.3f raw_chunk_count=%d "
+                    "last_raw_chunk_bytes=%d ms_since_last_raw_chunk=%.2f "
+                    "raw_bytes_since_last_event=%d "
                     "generation_elapsed_ms=%.2f recent_event_types=%s",
                     request_id, trace_id, phase, _elapsed_ms(started),
                     timeout_s, total_bytes,
@@ -470,6 +511,11 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
                     timeout_diag["reasoning_delta_count"],
                     timeout_diag["output_delta_count"],
                     timeout_diag["ms_since_last_output_delta"],
+                    timeout_diag["last_raw_chunk_at"],
+                    timeout_diag["raw_chunk_count"],
+                    timeout_diag["last_raw_chunk_bytes"],
+                    timeout_diag["ms_since_last_raw_chunk"],
+                    timeout_diag["raw_bytes_since_last_event"],
                     timeout_diag["generation_elapsed_ms"],
                     timeout_diag["recent_event_types"],
                 )
@@ -478,6 +524,7 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
                     f"{timeout_s:.0f}s"
                 ) from None
             total_bytes += len(chunk)
+            _record_upstream_chunk(response, len(chunk))
             if not diag.get("track_generation_start"):
                 diag["last_generation_at"] = time.perf_counter()
             yield chunk

@@ -1319,6 +1319,7 @@ def test_first_byte_timeout_policy_uses_serialized_body_size():
         "generation_started": False,
     }
     setattr(diagnostic_response, proxy_module._DIAG_ATTR, diagnostic_state)
+    proxy_module._record_upstream_chunk(diagnostic_response, 11)
     for event in (
         {"type": "response.created"},
         {"type": "response.reasoning_summary_text.delta", "delta": "thinking"},
@@ -1328,6 +1329,7 @@ def test_first_byte_timeout_policy_uses_serialized_body_size():
         {"type": "response.output_item.done"},
     ):
         proxy_module._record_upstream_event(diagnostic_response, event)
+    proxy_module._record_upstream_chunk(diagnostic_response, 23)
     timeout_diag = proxy_module._timeout_event_diagnostics(
         diagnostic_state, diagnostic_started, "stream_idle"
     )
@@ -1341,12 +1343,26 @@ def test_first_byte_timeout_policy_uses_serialized_body_size():
         "reasoning_delta_count",
         "output_delta_count",
         "ms_since_last_output_delta",
+        "last_raw_chunk_at",
+        "raw_chunk_count",
+        "last_raw_chunk_bytes",
+        "ms_since_last_raw_chunk",
+        "raw_bytes_since_last_event",
         "generation_elapsed_ms",
         "recent_event_types",
     }
     check(
         "timeout diagnostics expose every promised evidence field",
         required_timeout_fields <= timeout_diag.keys(),
+        str(timeout_diag),
+    )
+    check(
+        "timeout diagnostics record raw transport activity",
+        timeout_diag["last_raw_chunk_at"] > 0
+        and timeout_diag["raw_chunk_count"] == 2
+        and timeout_diag["last_raw_chunk_bytes"] == 23
+        and timeout_diag["ms_since_last_raw_chunk"] >= 0
+        and timeout_diag["raw_bytes_since_last_event"] == 23,
         str(timeout_diag),
     )
     check(
