@@ -46,6 +46,10 @@ _STREAM_OUTPUT_DELTA_TYPES = frozenset({
     "response.output_text.delta",
     "response.function_call_arguments.delta",
 })
+_REASONING_DELTA_TYPES = frozenset({
+    "response.reasoning_summary_text.delta",
+})
+_RECENT_EVENT_TYPES_LIMIT = 20
 
 _TERMINAL = ("response.completed", "response.failed", "response.incomplete")
 _USAGE_TOP = ("input_tokens", "output_tokens", "total_tokens")
@@ -95,6 +99,70 @@ def _mark_generation_started(response: Any) -> None:
         diag["generation_started"] = True
         diag["generation_started_at"] = now
     diag["last_generation_at"] = now
+
+
+def _record_upstream_event(response: Any, event: Any) -> None:
+    """Record compact event diagnostics shared by HTTP and WebSocket paths."""
+    if not isinstance(event, dict):
+        return
+    diag = _response_diag(response)
+    if not diag:
+        return
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        event_type = "-"
+    now_mono = time.perf_counter()
+    now_wall = time.time()
+    diag["last_event_type"] = event_type
+    diag["last_event_at"] = now_wall
+    diag["last_event_monotonic"] = now_mono
+    recent = diag.setdefault("recent_event_types", [])
+    if isinstance(recent, list):
+        recent.append(event_type)
+        del recent[:-_RECENT_EVENT_TYPES_LIMIT]
+
+    if event_type in _REASONING_DELTA_TYPES:
+        diag["last_reasoning_delta_at"] = now_wall
+        diag["last_reasoning_delta_monotonic"] = now_mono
+        diag["reasoning_delta_count"] = int(
+            diag.get("reasoning_delta_count") or 0
+        ) + 1
+
+    if event_type in _STREAM_OUTPUT_DELTA_TYPES:
+        _mark_generation_started(response)
+        diag["last_output_delta_type"] = event_type
+        diag["last_output_delta_at"] = now_wall
+        diag["last_output_delta_monotonic"] = now_mono
+        diag["output_delta_count"] = int(diag.get("output_delta_count") or 0) + 1
+
+
+def _timeout_event_diagnostics(
+    diag: dict[str, Any], started: float, timeout_phase: str
+) -> dict[str, Any]:
+    """Build evidence fields emitted whenever an upstream timeout fires."""
+    now = time.perf_counter()
+    last_output = diag.get("last_output_delta_monotonic")
+    ms_since_last_output = (
+        (now - float(last_output)) * 1000 if last_output is not None else -1.0
+    )
+    recent = diag.get("recent_event_types")
+    return {
+        "timeout_phase": timeout_phase,
+        "last_event_type": str(diag.get("last_event_type") or "-"),
+        "last_event_at": float(diag.get("last_event_at") or 0.0),
+        "last_reasoning_delta_at": float(
+            diag.get("last_reasoning_delta_at") or 0.0
+        ),
+        "last_output_delta_type": str(
+            diag.get("last_output_delta_type") or "-"
+        ),
+        "last_output_delta_at": float(diag.get("last_output_delta_at") or 0.0),
+        "reasoning_delta_count": int(diag.get("reasoning_delta_count") or 0),
+        "output_delta_count": int(diag.get("output_delta_count") or 0),
+        "ms_since_last_output_delta": ms_since_last_output,
+        "generation_elapsed_ms": (now - started) * 1000,
+        "recent_event_types": ">".join(recent) if isinstance(recent, list) else "-",
+    }
 
 
 def first_byte_timeout_for_body(
@@ -340,24 +408,62 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
             except asyncio.TimeoutError:
                 if generation_started:
                     outcome = "stream_idle_timeout"
+                    timeout_diag = _timeout_event_diagnostics(
+                        diag, started, "stream_idle"
+                    )
                     log.warning(
                         "event=upstream_stream_idle_timeout request_id=%s "
                         "trace_id=%s phase=%s elapsed_ms=%.2f "
-                        "stage=stream_idle idle_timeout_s=%.1f body_bytes=%d",
+                        "stage=stream_idle idle_timeout_s=%.1f body_bytes=%d "
+                        "timeout_phase=%s last_event_type=%s last_event_at=%.3f "
+                        "last_reasoning_delta_at=%.3f last_output_delta_type=%s "
+                        "last_output_delta_at=%.3f reasoning_delta_count=%d "
+                        "output_delta_count=%d ms_since_last_output_delta=%.2f "
+                        "generation_elapsed_ms=%.2f recent_event_types=%s",
                         request_id, trace_id, phase, _elapsed_ms(started),
                         stream_idle_timeout_s, total_bytes,
+                        timeout_diag["timeout_phase"],
+                        timeout_diag["last_event_type"],
+                        timeout_diag["last_event_at"],
+                        timeout_diag["last_reasoning_delta_at"],
+                        timeout_diag["last_output_delta_type"],
+                        timeout_diag["last_output_delta_at"],
+                        timeout_diag["reasoning_delta_count"],
+                        timeout_diag["output_delta_count"],
+                        timeout_diag["ms_since_last_output_delta"],
+                        timeout_diag["generation_elapsed_ms"],
+                        timeout_diag["recent_event_types"],
                     )
                     raise UpstreamStreamIdleTimeout(
                         "upstream stream idle timeout after "
                         f"{stream_idle_timeout_s:.0f}s"
                     ) from None
                 outcome = "generation_timeout"
+                timeout_diag = _timeout_event_diagnostics(
+                    diag, started, "generation"
+                )
                 log.warning(
                     "event=upstream_generation_timeout request_id=%s "
                     "trace_id=%s phase=%s elapsed_ms=%.2f "
-                    "stage=generation timeout_s=%.1f body_bytes=%d",
+                    "stage=generation timeout_s=%.1f body_bytes=%d "
+                    "timeout_phase=%s last_event_type=%s last_event_at=%.3f "
+                    "last_reasoning_delta_at=%.3f last_output_delta_type=%s "
+                    "last_output_delta_at=%.3f reasoning_delta_count=%d "
+                    "output_delta_count=%d ms_since_last_output_delta=%.2f "
+                    "generation_elapsed_ms=%.2f recent_event_types=%s",
                     request_id, trace_id, phase, _elapsed_ms(started),
                     timeout_s, total_bytes,
+                    timeout_diag["timeout_phase"],
+                    timeout_diag["last_event_type"],
+                    timeout_diag["last_event_at"],
+                    timeout_diag["last_reasoning_delta_at"],
+                    timeout_diag["last_output_delta_type"],
+                    timeout_diag["last_output_delta_at"],
+                    timeout_diag["reasoning_delta_count"],
+                    timeout_diag["output_delta_count"],
+                    timeout_diag["ms_since_last_output_delta"],
+                    timeout_diag["generation_elapsed_ms"],
+                    timeout_diag["recent_event_types"],
                 )
                 raise UpstreamGenerationTimeout(
                     "upstream generation timeout after "
@@ -790,8 +896,7 @@ async def fold_stream(
                 if not isinstance(ev, dict):
                     continue
                 t = ev.get("type", "")
-                if is_generation_delta_event(ev):
-                    _mark_generation_started(response)
+                _record_upstream_event(response, ev)
 
                 # Lifecycle: emit one created+in_progress (round 1), swallow the rest.
                 if t in ("response.created", "response.in_progress"):

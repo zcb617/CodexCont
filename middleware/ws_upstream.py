@@ -23,7 +23,9 @@ from .proxy import (
     STREAM_IDLE_TIMEOUT_S,
     UpstreamGenerationTimeout,
     UpstreamStreamIdleTimeout,
+    _record_upstream_event,
     _remaining_first_byte_timeout,
+    _timeout_event_diagnostics,
     first_byte_timeout_for_body,
     is_generation_delta_event,
 )
@@ -156,13 +158,9 @@ class UpstreamWebSocketResponse:
         event = self._first_event
         self._first_event = None
         while event is not None:
-            if is_generation_delta_event(event):
-                self._generation_started = True
-                diagnostics = getattr(self, _DIAG_ATTR, {})
-                now = time.perf_counter()
-                diagnostics["generation_started"] = True
-                diagnostics.setdefault("generation_started_at", now)
-                diagnostics["last_generation_at"] = now
+            _record_upstream_event(self, event)
+            diagnostics = getattr(self, _DIAG_ATTR, {})
+            self._generation_started = bool(diagnostics.get("generation_started"))
             terminal = event.get("type") in _TERMINAL_EVENTS
             if terminal:
                 self._terminal_received = True
@@ -397,28 +395,66 @@ class UpstreamWebSocketSession:
         except asyncio.TimeoutError:
             await self._drop_connection()
             if generation_started:
+                timeout_diag = _timeout_event_diagnostics(
+                    diag, started, "stream_idle"
+                )
                 log.warning(
                     "event=upstream_stream_idle_timeout request_id=%s "
                     "trace_id=%s phase=%s elapsed_ms=%.2f "
-                    "stage=stream_idle idle_timeout_s=%.1f",
+                    "stage=stream_idle idle_timeout_s=%.1f "
+                    "timeout_phase=%s last_event_type=%s last_event_at=%.3f "
+                    "last_reasoning_delta_at=%.3f last_output_delta_type=%s "
+                    "last_output_delta_at=%.3f reasoning_delta_count=%d "
+                    "output_delta_count=%d ms_since_last_output_delta=%.2f "
+                    "generation_elapsed_ms=%.2f recent_event_types=%s",
                     diag.get("request_id") or "-",
                     diag.get("trace_id") or "-",
                     diag.get("phase") or "-",
                     (time.perf_counter() - started) * 1000,
                     self.stream_idle_timeout_s,
+                    timeout_diag["timeout_phase"],
+                    timeout_diag["last_event_type"],
+                    timeout_diag["last_event_at"],
+                    timeout_diag["last_reasoning_delta_at"],
+                    timeout_diag["last_output_delta_type"],
+                    timeout_diag["last_output_delta_at"],
+                    timeout_diag["reasoning_delta_count"],
+                    timeout_diag["output_delta_count"],
+                    timeout_diag["ms_since_last_output_delta"],
+                    timeout_diag["generation_elapsed_ms"],
+                    timeout_diag["recent_event_types"],
                 )
                 raise UpstreamStreamIdleTimeout(
                     "upstream WebSocket stream idle timeout after "
                     f"{self.stream_idle_timeout_s:.0f}s"
                 ) from None
+            timeout_diag = _timeout_event_diagnostics(
+                diag, started, "generation"
+            )
             log.warning(
                 "event=upstream_generation_timeout request_id=%s trace_id=%s "
-                "phase=%s elapsed_ms=%.2f stage=generation timeout_s=%.1f",
+                "phase=%s elapsed_ms=%.2f stage=generation timeout_s=%.1f "
+                "timeout_phase=%s last_event_type=%s last_event_at=%.3f "
+                "last_reasoning_delta_at=%.3f last_output_delta_type=%s "
+                "last_output_delta_at=%.3f reasoning_delta_count=%d "
+                "output_delta_count=%d ms_since_last_output_delta=%.2f "
+                "generation_elapsed_ms=%.2f recent_event_types=%s",
                 diag.get("request_id") or "-",
                 diag.get("trace_id") or "-",
                 diag.get("phase") or "-",
                 (time.perf_counter() - started) * 1000,
                 generation_timeout_s,
+                timeout_diag["timeout_phase"],
+                timeout_diag["last_event_type"],
+                timeout_diag["last_event_at"],
+                timeout_diag["last_reasoning_delta_at"],
+                timeout_diag["last_output_delta_type"],
+                timeout_diag["last_output_delta_at"],
+                timeout_diag["reasoning_delta_count"],
+                timeout_diag["output_delta_count"],
+                timeout_diag["ms_since_last_output_delta"],
+                timeout_diag["generation_elapsed_ms"],
+                timeout_diag["recent_event_types"],
             )
             raise UpstreamGenerationTimeout(
                 "upstream WebSocket generation timeout after "

@@ -1255,6 +1255,54 @@ def test_first_byte_timeout_policy_uses_serialized_body_size():
         }),
     )
 
+    diagnostic_response = FakeResp(b"")
+    diagnostic_started = __import__("time").perf_counter()
+    diagnostic_state = {
+        "started": diagnostic_started,
+        "generation_started": False,
+    }
+    setattr(diagnostic_response, proxy_module._DIAG_ATTR, diagnostic_state)
+    for event in (
+        {"type": "response.created"},
+        {"type": "response.reasoning_summary_text.delta", "delta": "thinking"},
+        {"type": "response.output_text.delta", "delta": "answer"},
+        {"type": "response.function_call_arguments.delta", "delta": "{}"},
+    ):
+        proxy_module._record_upstream_event(diagnostic_response, event)
+    timeout_diag = proxy_module._timeout_event_diagnostics(
+        diagnostic_state, diagnostic_started, "stream_idle"
+    )
+    required_timeout_fields = {
+        "timeout_phase",
+        "last_event_type",
+        "last_event_at",
+        "last_reasoning_delta_at",
+        "last_output_delta_type",
+        "last_output_delta_at",
+        "reasoning_delta_count",
+        "output_delta_count",
+        "ms_since_last_output_delta",
+        "generation_elapsed_ms",
+        "recent_event_types",
+    }
+    check(
+        "timeout diagnostics expose every promised evidence field",
+        required_timeout_fields <= timeout_diag.keys(),
+        str(timeout_diag),
+    )
+    check(
+        "timeout diagnostics record reasoning and final output events",
+        timeout_diag["last_event_type"]
+        == "response.function_call_arguments.delta"
+        and timeout_diag["last_output_delta_type"]
+        == "response.function_call_arguments.delta"
+        and timeout_diag["reasoning_delta_count"] == 1
+        and timeout_diag["output_delta_count"] == 2
+        and "response.reasoning_summary_text.delta"
+        in timeout_diag["recent_event_types"],
+        str(timeout_diag),
+    )
+
 
 async def test_first_byte_timeout_on_headers():
     """send() hanging past FIRST_BYTE_TIMEOUT_S becomes ReadTimeout."""
