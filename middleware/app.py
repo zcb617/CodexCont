@@ -103,7 +103,9 @@ def _body_for_upstream(body: dict[str, Any], url: str) -> dict[str, Any]:
     if "previous_response_id" not in body or not _is_chatgpt_codex_responses_url(url):
         return body
     out = dict(body)
-    out.pop("previous_response_id", None)
+    # 暂时保留第一轮请求中的 previous_response_id；原删除逻辑保留注释，
+    # 仅由 516 截断触发的 continuation 路径继续按原逻辑处理。
+    # out.pop("previous_response_id", None)
     return out
 
 

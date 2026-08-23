@@ -2037,6 +2037,77 @@ async def test_upstream_diagnostic_logs_correlate_504():
           headers[0] if headers else "missing")
 
 
+async def test_upstream_failed_terminal_logs_error():
+    cfg = load_config(ROOT / "config.toml")
+    response = FakeResp(
+        make_sse([
+            {
+                "type": "response.created",
+                "response": {"id": "resp_failed", "status": "in_progress"},
+            },
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_failed",
+                    "status": "failed",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded",
+                        "message": "request is too large",
+                    },
+                    "incomplete_details": {"reason": "error"},
+                },
+            },
+        ])
+    )
+    response.headers = {"cf-ray": "ray-terminal-test"}
+    capture = CaptureHandler()
+    logger = proxy_module.log
+    old_level = logger.level
+    old_propagate = logger.propagate
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(capture)
+    try:
+        await run_fold(
+            cfg,
+            {
+                "model": "gpt-5.5",
+                "previous_response_id": "resp_previous",
+                "input": [{"type": "message", "status": "incomplete"}],
+            },
+            response,
+            [],
+        )
+    finally:
+        logger.removeHandler(capture)
+        logger.setLevel(old_level)
+        logger.propagate = old_propagate
+
+    failures = [
+        message
+        for message in capture.messages
+        if "event=upstream_terminal_failure" in message
+    ]
+    check("failed terminal emits one diagnostic log", len(failures) == 1,
+          str(capture.messages))
+    message = failures[0] if failures else ""
+    check(
+        "failed terminal log preserves upstream error fields",
+        "terminal_type=response.failed" in message
+        and "response_status=failed" in message
+        and "error_type=invalid_request_error" in message
+        and "error_code=context_length_exceeded" in message
+        and "error_message='request is too large'" in message
+        and "incomplete_reason=error" in message
+        and "previous_response_id_present=yes" in message
+        and "input_items=1" in message
+        and "input_tail_shape=message:incomplete" in message
+        and "cf-ray:ray-terminal-test" in message,
+        message,
+    )
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -2074,6 +2145,7 @@ async def _main():
     test_payload_sqlite_records_ws_rounds()
     test_payload_sqlite_initialized_on_startup()
     await test_upstream_diagnostic_logs_correlate_504()
+    await test_upstream_failed_terminal_logs_error()
 
 
 def main():

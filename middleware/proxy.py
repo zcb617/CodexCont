@@ -702,6 +702,62 @@ def _fmt_usage(usage: dict[str, Any] | None) -> str:
     )
 
 
+def _terminal_error_summary(
+    terminal: dict[str, Any],
+) -> tuple[str, str, str, str]:
+    """Extract bounded, non-stream-content diagnostics from a terminal event."""
+    response = terminal.get("response") or {}
+    if not isinstance(response, dict):
+        response = {}
+
+    error = response.get("error")
+    if not isinstance(error, dict):
+        error = terminal.get("error")
+
+    if isinstance(error, dict):
+        error_type = str(error.get("type") or "-")
+        error_code = str(error.get("code") or "-")
+        message = error.get("message")
+    elif error is None:
+        error_type = "-"
+        error_code = "-"
+        message = "-"
+    else:
+        error_type = type(error).__name__
+        error_code = "-"
+        message = error
+
+    if not isinstance(message, str):
+        message = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+    error_message = message[:1000] or "-"
+
+    incomplete = response.get("incomplete_details")
+    if not isinstance(incomplete, dict):
+        incomplete = terminal.get("incomplete_details")
+    incomplete_reason = (
+        str(incomplete.get("reason") or "-")
+        if isinstance(incomplete, dict)
+        else "-"
+    )
+    return error_type, error_code, error_message, incomplete_reason
+
+
+def _input_shape_summary(input_items: Any, limit: int = 12) -> str:
+    """Summarize only type/status for the tail of input history, never content."""
+    if not isinstance(input_items, list) or not input_items:
+        return "-"
+
+    summary: list[str] = []
+    for item in input_items[-limit:]:
+        if not isinstance(item, dict):
+            summary.append(type(item).__name__)
+            continue
+        item_type = str(item.get("type") or item.get("role") or "-")[:40]
+        status = str(item.get("status") or "-")[:40]
+        summary.append(f"{item_type}:{status}")
+    return ",".join(summary)
+
+
 def _find_buffer(buf: list[dict[str, Any]], up_oi: Any) -> dict[str, Any] | None:
     for entry in buf:
         if entry["oi"] == up_oi:
@@ -964,7 +1020,50 @@ async def fold_stream(
 
                 if t in _TERMINAL:
                     terminal = ev
-                    usage = (ev.get("response") or {}).get("usage")
+                    terminal_response = ev.get("response") or {}
+                    if not isinstance(terminal_response, dict):
+                        terminal_response = {}
+                    usage = terminal_response.get("usage")
+                    terminal_status = terminal_response.get("status") or "-"
+                    if t == "response.failed" or terminal_status not in (
+                        "completed",
+                        "in_progress",
+                    ):
+                        error_type, error_code, error_message, incomplete_reason = (
+                            _terminal_error_summary(ev)
+                        )
+                        diag = _response_diag(response)
+                        recent = diag.get("recent_event_types")
+                        recent_event_types = (
+                            ">".join(recent) if isinstance(recent, list) else "-"
+                        )
+                        log.warning(
+                            "event=upstream_terminal_failure request_id=%s "
+                            "trace_id=%s transport=%s phase=%s round=%d "
+                            "terminal_type=%s response_status=%s response_id=%s "
+                            "previous_response_id_present=%s error_type=%s "
+                            "error_code=%s error_message=%r incomplete_reason=%s "
+                            "usage=%s input_items=%d input_tail_shape=%s "
+                            "upstream_ids=%s recent_event_types=%s",
+                            str(diag.get("request_id") or "-"),
+                            str(diag.get("trace_id") or trace_id or "-"),
+                            str(diag.get("transport") or transport or "-"),
+                            str(diag.get("phase") or f"fold_round_{round_no}"),
+                            round_no,
+                            t,
+                            terminal_status,
+                            str(terminal_response.get("id") or "-"),
+                            "yes" if base_body.get("previous_response_id") else "no",
+                            error_type,
+                            error_code,
+                            error_message,
+                            incomplete_reason,
+                            _fmt_usage(usage),
+                            len(orig_input),
+                            _input_shape_summary(orig_input),
+                            _response_header_ids(getattr(response, "headers", {})),
+                            recent_event_types,
+                        )
                     break
 
                 up_oi = ev.get("output_index")
