@@ -30,6 +30,7 @@ from middleware.app import (
     handle_responses_ws,
     _make_client,
     _resolve_upstream_url,
+    _resolve_models_upstream_url,
     _url_is_from_header,
 )
 from middleware.codex import (
@@ -77,10 +78,20 @@ async def parse_events(data: bytes) -> list:
 
 
 class FakeResp:
-    def __init__(self, data: bytes, status: int = 200, chunk: int = 4096):
+    def __init__(
+        self,
+        data: bytes,
+        status: int = 200,
+        chunk: int = 4096,
+        headers: dict[str, str] | None = None,
+    ):
+        # Raw upstream bytes returned by the fake response.
         self._data = data
+        # HTTP status code exposed to the middleware.
         self.status_code = status
-        self.headers: dict[str, str] = {}
+        # Headers supplied by the test case to exercise transparent forwarding.
+        self.headers: dict[str, str] = dict(headers or {})
+        # Maximum chunk size used by the fake streaming iterator.
         self._chunk = chunk
 
     async def aiter_bytes(self):
@@ -104,11 +115,23 @@ class FakeClient:
     body of each build_request (the per-continuation-round upstream payload)."""
 
     def __init__(self, responses: list[FakeResp]):
+        # Queue of responses consumed by successive upstream sends.
         self._responses = list(responses)
+        # Index of the next queued response.
         self._i = 0
+        # JSON request payloads used by existing Responses continuation tests.
         self.payloads: list[dict] = []
+        # Complete request metadata used by Models proxy assertions.
+        self.requests: list[dict] = []
 
     def build_request(self, *a, **k):
+        self.requests.append({
+            "method": a[0] if a else None,
+            "url": str(a[1]) if len(a) > 1 else None,
+            "headers": dict(k.get("headers") or {}),
+            "timeout": k.get("timeout"),
+            "content": k.get("content"),
+        })
         content = k.get("content")
         if content is not None:
             try:
@@ -1261,6 +1284,169 @@ def test_http_upstream_timeout_returns_504():
     )
 
 
+def test_models_config_and_url_resolution():
+    """Models config is independent from Responses-API-Base and keeps query pairs."""
+    cfg = load_config(ROOT / "config.example.toml")
+    check("models config paths loaded", cfg.server.models_paths == ("/v1/models",),
+          str(cfg.server.models_paths))
+    check(
+        "models config URL loaded",
+        cfg.upstream.models_url == "https://chatgpt.com/backend-api/codex/models",
+        cfg.upstream.models_url,
+    )
+    check("models timeout loaded", cfg.timeouts.models_timeout_s == 30.0,
+          str(cfg.timeouts.models_timeout_s))
+
+    configured = replace(
+        cfg,
+        upstream=replace(
+            cfg.upstream,
+            models_url="https://models.test/backend-api/codex/models?existing=1&dup=base",
+        ),
+    )
+    request = _Req({"Responses-API-Base": "https://wrong.test/v1"})
+    request.query_params = httpx.QueryParams(
+        [("client_version", "0.149.1"), ("dup", "first value"), ("dup", "second+value")]
+    )
+    resolved = _resolve_models_upstream_url(configured, request)
+    parsed = httpx.URL(resolved)
+    pairs = list(httpx.QueryParams(parsed.query).multi_items())
+    check(
+        "models URL ignores Responses-API-Base",
+        parsed.host == "models.test" and parsed.path == "/backend-api/codex/models",
+        resolved,
+    )
+    check(
+        "models URL preserves duplicate query pairs",
+        pairs == [
+            ("existing", "1"),
+            ("dup", "base"),
+            ("dup", "first value"),
+            ("dup", "second+value"),
+            ("client_version", "0.149.1"),
+        ],
+        str(pairs),
+    )
+
+
+def test_models_get_proxy_transparent_response_and_headers():
+    cfg = load_config(ROOT / "config.example.toml")
+    cfg = replace(
+        cfg,
+        auth=replace(cfg.auth, mode="passthrough"),
+        upstream=replace(
+            cfg.upstream,
+            models_url="https://chatgpt.com/backend-api/codex/models?source=cfg",
+        ),
+    )
+    raw = b'{"models":[{"id":"codex-special","capabilities":{"reasoning":true}}]}'
+    app = create_app(cfg)
+    fake = FakeClient([
+        FakeResp(
+            raw,
+            headers={
+                "content-type": "application/json; charset=utf-8",
+                "etag": '"models-v1"',
+                "set-cookie": "should-not-forward",
+                "connection": "close",
+            },
+        )
+    ])
+
+    with TestClient(app) as client:
+        app.state.client = fake
+        response = client.get(
+            "/v1/models?client_version=0.149.1&scope=codex&scope=full%20scope",
+            headers={
+                "Authorization": "Bearer agent-token",
+                "chatgpt-account-id": "acct-models",
+                "User-Agent": "codex-test/0.149.1",
+                "Responses-API-Base": "https://request-controlled.invalid/v1",
+                "Content-Length": "0",
+            },
+        )
+
+    check("models route GET returns 200", response.status_code == 200,
+          str(response.status_code))
+    check("models body is byte-for-byte unchanged", response.content == raw,
+          repr(response.content))
+    check(
+        "models content-type and etag preserved",
+        response.headers.get("content-type") == "application/json; charset=utf-8"
+        and response.headers.get("etag") == '"models-v1"',
+        str(dict(response.headers)),
+    )
+    check("models does not forward Set-Cookie", "set-cookie" not in response.headers)
+
+    request = fake.requests[0] if fake.requests else {}
+    headers = {str(k).lower(): str(v) for k, v in (request.get("headers") or {}).items()}
+    check(
+        "models forwards auth account and user agent",
+        headers.get("authorization") == "Bearer agent-token"
+        and headers.get("chatgpt-account-id") == "acct-models"
+        and headers.get("user-agent") == "codex-test/0.149.1",
+        str(headers),
+    )
+    check(
+        "models strips owned and control headers",
+        all(name not in headers for name in
+            ("host", "content-length", "responses-api-base")),
+        str(headers),
+    )
+    check("models sends GET with configured timeout",
+          request.get("method") == "GET" and request.get("timeout") == 30.0,
+          str(request))
+    upstream_url = request.get("url") or ""
+    query_pairs = list(httpx.QueryParams(httpx.URL(upstream_url).query).multi_items())
+    check(
+        "models forwards all query pairs",
+        query_pairs == [
+            ("source", "cfg"),
+            ("client_version", "0.149.1"),
+            ("scope", "codex"),
+            ("scope", "full scope"),
+        ],
+        str(query_pairs),
+    )
+    check("models does not add Responses payload", fake.payloads == [], str(fake.payloads))
+
+
+def test_models_upstream_status_body_and_transport_errors():
+    cfg = load_config(ROOT / "config.example.toml")
+    raw = b'{"error":{"type":"upstream","message":"unchanged"}}'
+    for status in (401, 403, 500):
+        app = create_app(cfg)
+        fake = FakeClient([FakeResp(raw, status=status, headers={"content-type": "application/json"})])
+        with TestClient(app, raise_server_exceptions=True) as client:
+            app.state.client = fake
+            response = client.get("/v1/models?client_version=0.149.1")
+        check(f"models preserves upstream status {status}", response.status_code == status,
+              str(response.status_code))
+        check(f"models preserves upstream body {status}", response.content == raw,
+              repr(response.content))
+
+    for exc, expected_status, label in (
+        (httpx.ReadError("read failed"), 502, "ReadError"),
+        (httpx.ReadTimeout("timed out"), 504, "ReadTimeout"),
+    ):
+        app = create_app(cfg)
+        failing = _RaisingClient(exc)
+        with TestClient(app, raise_server_exceptions=True) as client:
+            app.state.client = failing
+            response = client.get("/v1/models?client_version=0.149.1")
+        body = response.json()
+        err = body.get("error") if isinstance(body, dict) else None
+        check(f"models {label} maps status", response.status_code == expected_status,
+              str(response.status_code))
+        check(
+            f"models {label} maps structured error",
+            isinstance(err, dict)
+            and err.get("code") == "upstream_transport_error"
+            and err.get("type") == label,
+            str(body),
+        )
+
+
 def test_first_byte_timeout_policy_uses_serialized_body_size():
     cfg = load_config(ROOT / "config.example.toml")
     policy = cfg.timeouts
@@ -2132,6 +2318,9 @@ async def _main():
     test_http_downstream_keeps_http_upstream()
     test_http_upstream_read_error_returns_502_without_asgi_crash()
     test_http_upstream_timeout_returns_504()
+    test_models_config_and_url_resolution()
+    test_models_get_proxy_transparent_response_and_headers()
+    test_models_upstream_status_body_and_transport_errors()
     test_first_byte_timeout_policy_uses_serialized_body_size()
     await test_first_byte_timeout_on_headers()
     await test_first_byte_and_stream_idle_timeouts()

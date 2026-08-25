@@ -85,6 +85,19 @@ def _resolve_upstream_url(cfg: Config, request: Request) -> str | None:
     return cfg.upstream.url
 
 
+def _resolve_models_upstream_url(cfg: Config, request: Request) -> str:
+    """Build the fixed Models URL while preserving every downstream query pair.
+
+    Models is deliberately independent from ``Responses-API-Base``.  ``httpx.URL``
+    performs the required URL encoding. ``copy_add_param`` appends each pair so
+    existing upstream keys and downstream duplicate keys are all preserved.
+    """
+    base = httpx.URL(cfg.upstream.models_url)
+    for key, value in request.query_params.multi_items():
+        base = base.copy_add_param(key, value)
+    return str(base)
+
+
 def _url_is_from_header(cfg: Config, request: Request) -> bool:
     return cfg.upstream.mode in ("header", "header_required") and _header_base(request) is not None
 
@@ -452,6 +465,57 @@ async def handle_responses(request: Request) -> Response:
         ),
         media_type="text/event-stream",
     )
+
+
+async def handle_models(request: Request) -> Response:
+    """Proxy a Codex Models GET without parsing or rewriting its response body."""
+    cfg: Config = request.app.state.cfg
+    client: httpx.AsyncClient = request.app.state.client
+    trace_id = f"models_{uuid.uuid4().hex[:16]}"
+    started = time.perf_counter()
+    client_version = request.query_params.get("client_version") or "-"
+    url = _resolve_models_upstream_url(cfg, request)
+    log.info(
+        "event=models_request_start trace_id=%s transport=http client_version=%s "
+        "path=%s",
+        trace_id, client_version, request.url.path,
+    )
+
+    # Reuse the existing auth and header filtering policy; Models is read-only,
+    # so no request body or Responses fold state is read or created here.
+    headers = build_upstream_headers(request.headers.items(), cfg)
+    response: Any | None = None
+    try:
+        # The explicit timeout is attached to this request only; the shared client
+        # remains timeout=None for the existing Responses transport behavior.
+        upstream_request = client.build_request(
+            "GET",
+            url,
+            headers=headers,
+            timeout=cfg.timeouts.models_timeout_s,
+        )
+        response = await client.send(upstream_request, stream=True)
+        raw = await response.aread()
+        response_headers: dict[str, str] = {}
+        # Only these end-to-end headers are allowed; Starlette may add its own
+        # content-length, but upstream hop-by-hop and Set-Cookie headers are not copied.
+        for name in ("content-type", "etag"):
+            value = response.headers.get(name)
+            if value is not None:
+                response_headers[name] = value
+        status = response.status_code
+        log.info(
+            "event=models_request_end trace_id=%s transport=http outcome=upstream_response "
+            "upstream_status=%s elapsed_ms=%.2f",
+            trace_id, status, (time.perf_counter() - started) * 1000,
+        )
+        return Response(raw, status_code=status, headers=response_headers)
+    except httpx.HTTPError as exc:
+        return _http_upstream_transport_response(exc, trace_id=trace_id, started=started)
+    finally:
+        # Closing is required on both success and error after consuming raw bytes.
+        if response is not None:
+            await response.aclose()
 
 
 async def _receive_ws_messages(
@@ -867,8 +931,11 @@ def create_app(cfg: Config) -> Starlette:
             await app.state.client.aclose()
 
     routes = [
-        Route(path, handle_responses, methods=["POST"]) for path in cfg.server.listen_paths
+        Route(path, handle_models, methods=["GET"]) for path in cfg.server.models_paths
     ]
+    routes.extend(
+        Route(path, handle_responses, methods=["POST"]) for path in cfg.server.listen_paths
+    )
     routes.extend(
         WebSocketRoute(path, handle_responses_ws) for path in cfg.server.listen_paths
     )

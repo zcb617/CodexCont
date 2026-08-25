@@ -48,9 +48,15 @@ uv run python run.py
 
 `run.py` reads the local `config.toml`; start by copying `config.example.toml` and then adjust it as needed.
 
-The example default server listens on `127.0.0.1:8787` and accepts both HTTP POST and WebSocket connections at:
+The example default server listens on `127.0.0.1:8787`, exposes read-only `GET /v1/models`, and accepts both HTTP POST and WebSocket connections at:
 
 - `/v1/responses`
+
+`GET /v1/models` is transparently proxied to the Codex Models endpoint. Query
+parameters (including duplicate keys such as `client_version`) are forwarded
+unchanged, and the Codex-specific model metadata response is returned as raw
+bytes without JSON rewriting. The Responses endpoint remains available at
+`POST /v1/responses` and WebSocket `/v1/responses`.
 
 You can also run with the already-created virtual environment directly:
 
@@ -75,6 +81,7 @@ The example default configuration (`config.example.toml`, copied to `config.toml
 [upstream]
 url = "https://chatgpt.com/backend-api/codex/responses"
 mode = "header"
+models_url = "https://chatgpt.com/backend-api/codex/models"
 ```
 
 With `mode = "header"`, a `Responses-API-Base` request header overrides the configured `url`; when the header is absent, requests fall back to the configured Codex URL.
@@ -86,6 +93,12 @@ Responses-API-Base: https://api.openai.com/v1
 ```
 
 The middleware appends `/responses` unless the supplied value already ends with `/responses`. This control header is stripped before forwarding upstream.
+
+`models_url` is a separately configured, fixed Models upstream; it is never
+derived from `url` and is not affected by `Responses-API-Base`. Models requests
+reuse the existing authentication/header passthrough rules, including
+`Authorization`, `chatgpt-account-id`, and `User-Agent`.
+The `[timeouts].models_timeout_s` field (default `30.0`) controls this GET.
 
 ## Transport mapping
 
@@ -171,6 +184,7 @@ Current offline coverage includes:
 - commentary and tool-pair continuation payloads
 - header transparency
 - upstream URL resolution
+- transparent `GET /v1/models` proxying, query forwarding, and raw response bytes
 - auth safety guard
 - EOF/upstream-error behavior
 - HTTP/HTTP and WebSocket/WebSocket transport mapping

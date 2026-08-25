@@ -46,9 +46,14 @@ uv run python run.py
 
 `run.py` 会读取本地 `config.toml`；请先从 `config.example.toml` 复制一份，再按需调整。
 
-示例默认服务监听 `127.0.0.1:8787`，在以下路径同时接受 HTTP POST 和 WebSocket 连接：
+示例默认服务监听 `127.0.0.1:8787`，公开只读的 `GET /v1/models`，并在以下路径同时接受 HTTP POST 和 WebSocket 连接：
 
 - `/v1/responses`
+
+`GET /v1/models` 会透明代理到 Codex Models 上游。查询参数（包括
+`client_version` 等重复参数）会完整转发，Codex 专用模型元数据响应按原始
+bytes 返回，不解析或改写 JSON。Responses 接口仍由 `POST /v1/responses`
+和 WebSocket `/v1/responses` 提供。
 
 也可以直接使用当前虚拟环境运行：
 
@@ -73,6 +78,7 @@ http://127.0.0.1:8787/v1/responses
 [upstream]
 url = "https://chatgpt.com/backend-api/codex/responses"
 mode = "header"
+models_url = "https://chatgpt.com/backend-api/codex/models"
 ```
 
 当 `mode = "header"` 时，请求头 `Responses-API-Base` 会覆盖配置中的 `url`；如果没有该请求头，则回退到配置的 Codex URL。
@@ -84,6 +90,11 @@ Responses-API-Base: https://api.openai.com/v1
 ```
 
 中间件会自动追加 `/responses`；如果传入值已经以 `/responses` 结尾，则保持不变。该控制头不会被继续转发到上游。
+
+`models_url` 是独立配置的固定 Models 上游，不从 `url` 推导，也不受
+`Responses-API-Base` 影响。Models 请求复用现有鉴权和请求头透传规则，包含
+`Authorization`、`chatgpt-account-id` 与 `User-Agent`。
+`[timeouts].models_timeout_s`（默认 `30.0`）控制该 GET 请求的超时时间。
 
 ## 传输协议映射
 
@@ -169,6 +180,7 @@ uv run python tests/test_middleware.py
 - commentary 和 tool-pair 两种续写 payload
 - header 透明转发
 - 上游 URL 解析
+- `GET /v1/models` 透明代理、查询参数转发与原始响应 bytes
 - 鉴权安全保护
 - EOF / 上游错误处理
 - HTTP/HTTP 与 WebSocket/WebSocket 传输映射

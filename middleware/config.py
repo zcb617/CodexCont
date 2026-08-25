@@ -13,21 +13,32 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ServerCfg:
+    # Hostname or address on which the local Starlette server listens.
     host: str = "127.0.0.1"
+    # TCP port for the local Starlette server.
     port: int = 8787
+    # HTTP/WebSocket Responses paths exposed by the proxy.
     listen_paths: tuple[str, ...] = (
         "/backend-api/codex/responses",
         "/v1/responses",
+    )
+    # Read-only Models paths exposed by the proxy.
+    models_paths: tuple[str, ...] = (
+        "/backend-api/codex/models",
+        "/v1/models",
     )
 
 
 @dataclass(frozen=True)
 class UpstreamCfg:
+    # Upstream Responses endpoint used by HTTP and WebSocket requests.
     url: str = "https://chatgpt.com/backend-api/codex/responses"
     # "fixed"           = always use `url`, ignore the Responses-API-Base header.
     # "header"          = use the Responses-API-Base header if present, else `url`.
     # "header_required" = require the header; if absent, reject the request (400).
     mode: str = "fixed"
+    # Fixed Codex Models endpoint; this is independent of Responses URL mode.
+    models_url: str = "https://chatgpt.com/backend-api/codex/models"
     # Optional explicit header overrides applied LAST; empty by default so the
     # proxy is a pure header passthrough and invents nothing (no User-Agent).
     headers: dict[str, str] = field(default_factory=dict)
@@ -74,12 +85,20 @@ class LogCfg:
 
 @dataclass(frozen=True)
 class TimeoutCfg:
+    # Maximum serialized request size for the small first-byte timeout tier.
     small_body_max_bytes: int = 8 * 1024 * 1024
+    # Maximum serialized request size for the medium first-byte timeout tier.
     large_body_max_bytes: int = 32 * 1024 * 1024
+    # First-byte timeout for small requests.
     small_timeout_s: float = 60.0
+    # First-byte timeout for medium requests.
     medium_timeout_s: float = 180.0
+    # First-byte timeout for large requests.
     large_timeout_s: float = 300.0
+    # Maximum idle time between streamed upstream events.
     stream_idle_timeout_s: float = 5.0
+    # Timeout for the read-only Models request.
+    models_timeout_s: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -125,6 +144,9 @@ def load_config(path: str | Path) -> Config:
     # listen_paths is a list in TOML; store as tuple.
     if "listen_paths" in server and isinstance(server["listen_paths"], list):
         server = {**server, "listen_paths": tuple(server["listen_paths"])}
+    # models_paths is a list in TOML; store it as an immutable tuple like listen_paths.
+    if "models_paths" in server and isinstance(server["models_paths"], list):
+        server = {**server, "models_paths": tuple(server["models_paths"])}
 
     # [upstream.headers] is a nested table under [upstream].
     up_headers = upstream.get("headers") or {}
