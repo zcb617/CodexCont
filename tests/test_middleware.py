@@ -264,8 +264,12 @@ class CaptureHandler(logging.Handler):
     def __init__(self):
         super().__init__()
         self.messages: list[str] = []
+        # 捕获的日志记录对象，用于断言业务日志级别。
+        self.records: list[logging.LogRecord] = []
 
     def emit(self, record: logging.LogRecord) -> None:
+        """同时保留格式化消息与原始记录，供日志行为断言使用。"""
+        self.records.append(record)
         self.messages.append(record.getMessage())
 
 
@@ -499,6 +503,37 @@ async def test_commentary_continuation_payload():
     # forward_marker defaults false → marker stays hidden from the downstream stream
     check("commentary: marker hidden downstream by default",
           not any((e.get("item") or {}).get("phase") == "commentary" for e in evs))
+
+
+async def test_commentary_continuation_log_warning():
+    """验证自动续发时的 round 决策日志以 WARNING 级别输出。"""
+    cfg = load_config(ROOT / "config.toml")
+    base_body = {"model": "gpt-5.5", "input": [{"role": "user", "content": "q"}]}
+    rA = FakeResp(_round("rs_a", "ENC_A", 516, msg="trunc"))
+    rB = FakeResp(_round("rs_b", "ENC_B", 999, msg="done"))
+    client = FakeClient([rB])
+    capture = CaptureHandler()
+    old_level = proxy_module.log.level
+    old_propagate = proxy_module.log.propagate
+    proxy_module.log.setLevel(logging.INFO)
+    proxy_module.log.propagate = False
+    proxy_module.log.addHandler(capture)
+    try:
+        await run_fold_capture(cfg, base_body, rA, client)
+    finally:
+        proxy_module.log.removeHandler(capture)
+        proxy_module.log.setLevel(old_level)
+        proxy_module.log.propagate = old_propagate
+
+    continuation_records = [
+        record for record in capture.records
+        if "round 1:" in record.getMessage() and "-> continue" in record.getMessage()
+    ]
+    check("commentary continuation warning log count", len(continuation_records) == 1,
+          str(len(continuation_records)))
+    check("commentary continuation warning log level",
+          continuation_records[0].levelno == logging.WARNING if continuation_records else False,
+          str(continuation_records[0].levelno if continuation_records else None))
 
 
 async def test_tool_pair_continuation_payload():
@@ -2303,6 +2338,7 @@ async def _main():
     await test_fold_real_captures()
     await test_truncated_tool_call_discarded()
     await test_commentary_continuation_payload()
+    await test_commentary_continuation_log_warning()
     await test_tool_pair_continuation_payload()
     await test_forward_marker_emits_downstream()
     test_header_transparency()

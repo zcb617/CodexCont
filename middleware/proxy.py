@@ -1144,8 +1144,9 @@ async def fold_stream(
                 else "upstream_eof" if not saw_terminal
                 else stopped_reason or "clean"
             )
-            log.info("round %d: %s | n=%s buffered=%s -> %s",
-                     round_no, _fmt_usage(usage), n, buffered or "[]", decision)
+            log_method = log.warning if decision == "continue" else log.info
+            log_method("round %d: %s | n=%s buffered=%s -> %s",
+                       round_no, _fmt_usage(usage), n, buffered or "[]", decision)
 
             await response.aclose()
 
