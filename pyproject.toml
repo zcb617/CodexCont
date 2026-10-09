@@ -8,6 +8,7 @@ dependencies = [
     "starlette>=0.37",
     "uvicorn>=0.30",
     "websockets>=13",
+    "zstandard>=0.23",
 ]
 
 [dependency-groups]

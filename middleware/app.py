@@ -12,10 +12,12 @@ import json
 import logging
 import time
 import uuid
+from io import BytesIO
 from typing import Any, AsyncIterator, Iterable
 from urllib.parse import urlparse
 
 import httpx
+import zstandard as zstd
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -175,6 +177,21 @@ async def _iter_sse_events(byte_iter: AsyncIterator[bytes]) -> AsyncIterator[dic
 
 def _json_body_bytes(body: dict[str, Any]) -> bytes:
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+
+def _is_zstd_content_encoding(value: str | None) -> bool:
+    """判断请求 Content-Encoding 是否包含 zstd 编码，供请求体检查使用。"""
+    if not value:
+        return False
+    return any(token.strip().lower() == "zstd" for token in value.split(","))
+
+
+def _decode_body_for_inspection(raw: bytes, content_encoding: str | None) -> bytes:
+    """按请求编码解压用于 JSON 解析的副本，保持纯透传使用的 raw 不变。"""
+    if not _is_zstd_content_encoding(content_encoding):
+        return raw
+    with zstd.ZstdDecompressor().stream_reader(BytesIO(raw)) as reader:
+        return reader.read()
 
 
 def _ws_upstream_headers(headers: Iterable[tuple[str, str]], cfg: Config) -> dict[str, str]:
@@ -357,9 +374,17 @@ async def handle_responses(request: Request) -> Response:
 
     raw = await request.body()
     try:
-        body: dict[str, Any] = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        inspection_raw = _decode_body_for_inspection(
+            raw, request.headers.get("content-encoding")
+        )
+        body: dict[str, Any] = json.loads(inspection_raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, zstd.ZstdError) as exc:
+        log.exception(
+            "event=downstream_request_parse_error trace_id=%s error_type=%s",
+            trace_id,
+            type(exc).__name__,
+        )
+        return JSONResponse({"error": str(exc)}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
 
@@ -412,6 +437,10 @@ async def handle_responses(request: Request) -> Response:
         }
 
     headers = build_upstream_headers(request.headers.items(), cfg)
+    headers = {
+        name: value for name, value in headers.items()
+        if name.lower() != "content-encoding"
+    }
     upstream_body = _body_for_upstream(body, url)
     payload = build_round_payload(
         upstream_body,

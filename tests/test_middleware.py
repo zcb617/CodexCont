@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import zstandard as zstd
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -136,7 +137,7 @@ class FakeClient:
         if content is not None:
             try:
                 self.payloads.append(json.loads(content))
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
                 pass
         return ("req", a, k)
 
@@ -1249,6 +1250,133 @@ def test_http_downstream_keeps_http_upstream():
     check("http downstream never opens upstream ws", not ws_calls, str(ws_calls))
 
 
+def test_http_zstd_passthrough_preserves_raw_body_and_header():
+    """验证 zstd 纯透传保留客户端原始压缩字节和 Content-Encoding。"""
+    base = load_config(ROOT / "config.toml")
+    cfg = replace(base, cont=replace(base.cont, enabled=False))
+    app = create_app(cfg)
+    http_client = FakeClient([
+        FakeResp(_round("rs_zstd_passthrough", "ENC_ZSTD", 999, msg="zstd done"))
+    ])
+    ws_calls: list[dict] = []
+    body = {"model": "gpt-5.5", "stream": False, "input": []}
+    compressed = zstd.ZstdCompressor(write_content_size=False).compress(
+        json.dumps(body).encode("utf-8")
+    )
+
+    async def forbidden_ws_connector(**kwargs):
+        ws_calls.append(kwargs)
+        raise AssertionError("HTTP downstream must not open an upstream WebSocket")
+
+    with TestClient(app) as client:
+        app.state.client = http_client
+        app.state.ws_connector = forbidden_ws_connector
+        response = client.post(
+            "/v1/responses",
+            content=compressed,
+            headers={"Content-Type": "application/json", "Content-Encoding": "zstd"},
+        )
+
+    upstream_request = http_client.requests[0] if http_client.requests else {}
+    upstream_headers = {
+        name.lower(): value for name, value in upstream_request.get("headers", {}).items()
+    }
+    check("http zstd passthrough returns 200", response.status_code == 200)
+    check("http zstd passthrough sends one request", len(http_client.requests) == 1)
+    check(
+        "http zstd passthrough preserves raw body",
+        upstream_request.get("content") == compressed,
+        repr(upstream_request.get("content")),
+    )
+    check(
+        "http zstd passthrough preserves content-encoding",
+        upstream_headers.get("content-encoding") == "zstd",
+        repr(upstream_headers),
+    )
+    check("http zstd passthrough never opens upstream ws", not ws_calls, str(ws_calls))
+
+
+def test_http_zstd_fold_removes_content_encoding_and_sends_json():
+    """验证 zstd fold 首轮使用明文 JSON，并移除上游 Content-Encoding。"""
+    base = load_config(ROOT / "config.toml")
+    cfg = replace(base, cont=replace(base.cont, enabled=True))
+    app = create_app(cfg)
+    http_client = FakeClient([
+        FakeResp(_round("rs_zstd_fold", "ENC_ZSTD_FOLD", 999, msg="fold done"))
+    ])
+    ws_calls: list[dict] = []
+    body = {
+        "model": "gpt-5.5",
+        "stream": True,
+        "input": [{"role": "user", "content": "fold this"}],
+    }
+    compressed = zstd.ZstdCompressor(write_content_size=False).compress(
+        json.dumps(body).encode("utf-8")
+    )
+
+    async def forbidden_ws_connector(**kwargs):
+        ws_calls.append(kwargs)
+        raise AssertionError("HTTP downstream must not open an upstream WebSocket")
+
+    with TestClient(app) as client:
+        app.state.client = http_client
+        app.state.ws_connector = forbidden_ws_connector
+        response = client.post(
+            "/v1/responses",
+            content=compressed,
+            headers={"Content-Type": "application/json", "Content-Encoding": "zstd"},
+        )
+
+    upstream_request = http_client.requests[0] if http_client.requests else {}
+    upstream_headers = {
+        name.lower(): value for name, value in upstream_request.get("headers", {}).items()
+    }
+    upstream_body = None
+    try:
+        upstream_body = json.loads(upstream_request.get("content", b""))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    check("http zstd fold returns 200", response.status_code == 200)
+    check("http zstd fold sends one request", len(http_client.requests) == 1)
+    check("http zstd fold sends parseable JSON", isinstance(upstream_body, dict))
+    check(
+        "http zstd fold removes content-encoding",
+        "content-encoding" not in upstream_headers,
+        repr(upstream_headers),
+    )
+    check(
+        "http zstd fold preserves model and input",
+        isinstance(upstream_body, dict)
+        and upstream_body.get("model") == body["model"]
+        and upstream_body.get("input") == body["input"],
+        repr(upstream_body),
+    )
+    check("http zstd fold never opens upstream ws", not ws_calls, str(ws_calls))
+
+
+def test_http_zstd_invalid_body_returns_400():
+    """验证非法 zstd body 返回原始库错误且不访问上游。"""
+    cfg = load_config(ROOT / "config.toml")
+    app = create_app(cfg)
+    http_client = FakeClient([])
+
+    with TestClient(app) as client:
+        app.state.client = http_client
+        response = client.post(
+            "/v1/responses",
+            content=b"not-zstd",
+            headers={"Content-Type": "application/json", "Content-Encoding": "zstd"},
+        )
+
+    check("http invalid zstd returns 400", response.status_code == 400)
+    check(
+        "http invalid zstd preserves original error",
+        response.json().get("error") == "zstd decompress error: Unknown frame descriptor",
+        response.text,
+    )
+    check("http invalid zstd sends no upstream request", not http_client.requests)
+
+
 class _RaisingClient(FakeClient):
     """HTTP client that fails before any upstream response is available."""
 
@@ -2352,6 +2480,9 @@ async def _main():
     await test_native_upstream_websocket_reuses_connection()
     await test_native_upstream_websocket_stream_idle_timeout()
     test_http_downstream_keeps_http_upstream()
+    test_http_zstd_passthrough_preserves_raw_body_and_header()
+    test_http_zstd_fold_removes_content_encoding_and_sends_json()
+    test_http_zstd_invalid_body_returns_400()
     test_http_upstream_read_error_returns_502_without_asgi_crash()
     test_http_upstream_timeout_returns_504()
     test_models_config_and_url_resolution()
