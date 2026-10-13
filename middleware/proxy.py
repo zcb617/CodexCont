@@ -920,6 +920,8 @@ def _reconstruct_terminal(
     if usage:
         resp["usage"] = usage
     resp["status"] = tresp.get("status", "completed")
+    if "error" in tresp:
+        resp["error"] = tresp["error"]
     if "incomplete_details" in tresp:
         resp["incomplete_details"] = tresp["incomplete_details"]
     _with_proxy_metadata(resp, rounds, stopped_reason, billed_usage)
