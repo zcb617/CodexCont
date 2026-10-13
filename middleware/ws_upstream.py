@@ -223,6 +223,12 @@ class UpstreamWebSocketSession:
             else STREAM_IDLE_TIMEOUT_S
         )
         self._active: UpstreamWebSocketResponse | None = None
+        # 保护同一上游连接上的 create 与 interrupt 发送顺序，避免并发写帧。
+        self._send_lock = asyncio.Lock()
+        # 当前上游原生响应 ID，用于把下游别名中断映射到实际响应。
+        self._current_response_id: str | None = None
+        # 首事件尚未到达时待发送的中断控制帧，按当前逻辑请求合并。
+        self._pending_interrupt: dict[str, Any] | None = None
         self._closed = False
         self._last_receive_size = 0
         response = getattr(connection, "response", None)
@@ -242,6 +248,8 @@ class UpstreamWebSocketSession:
 
         request_id = f"upws_{uuid.uuid4().hex[:16]}"
         started = time.perf_counter()
+        # 每轮重新绑定当前原生响应；待发中断保留到首 response.created 进行映射。
+        self._current_response_id = None
         event = response_create_payload(payload)
         encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         encoded_bytes = len(encoded.encode("utf-8"))
@@ -263,7 +271,9 @@ class UpstreamWebSocketSession:
         try:
             # First event only — same wall-clock budget as HTTP first body byte.
             async def _send_and_first_event() -> dict[str, Any]:
-                await self._connection.send(encoded)
+                # 只锁定发送动作；首事件接收保持独立，允许并发 interrupt 及时进入。
+                async with self._send_lock:
+                    await self._connection.send(encoded)
                 return await self._receive_json()
 
             first_event = await asyncio.wait_for(
@@ -371,7 +381,120 @@ class UpstreamWebSocketSession:
             raise UpstreamWebSocketError(
                 "Upstream WebSocket returned a non-object JSON event"
             )
+
+        # 首个 created 到达后绑定上游原生 ID，并发送此前暂存的中断控制帧。
+        if event.get("type") == "response.created":
+            response = event.get("response")
+            native_id = response.get("id") if isinstance(response, dict) else None
+            if isinstance(native_id, str) and native_id:
+                self._current_response_id = native_id
+                pending = self._pending_interrupt
+                if pending is not None:
+                    mode = pending.get("mode")
+                    try:
+                        async with self._send_lock:
+                            if self._connection is None:
+                                raise UpstreamWebSocketError(
+                                    "Upstream WebSocket connection is closed"
+                                )
+                            interrupt = {
+                                "type": "response.interrupt",
+                                "response_id": native_id,
+                                "mode": mode,
+                            }
+                            await self._connection.send(
+                                json.dumps(
+                                    interrupt,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )
+                            )
+                        self._pending_interrupt = None
+                        log.info(
+                            "event=upstream_ws_interrupt_forwarded connection_id=%s "
+                            "response_id=%s mode=%s",
+                            self.connection_id, native_id, mode,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.warning(
+                            "event=upstream_ws_interrupt_send_failed connection_id=%s "
+                            "response_id=%s error_type=%s error=%r",
+                            self.connection_id, native_id, type(exc).__name__, exc,
+                        )
+                        await self._drop_connection()
+                        if isinstance(exc, UpstreamWebSocketError):
+                            raise
+                        raise UpstreamWebSocketError(
+                            "Upstream WebSocket interrupt send failed"
+                        ) from exc
         return event
+
+    async def send_interrupt(
+        self,
+        event: dict[str, Any],
+        *,
+        trace_id: str,
+    ) -> None:
+        """将下游中断控制帧映射为当前上游原生响应并发送。"""
+        if self._closed or self._connection is None:
+            raise UpstreamWebSocketError("Upstream WebSocket connection is closed")
+
+        mode = event.get("mode")
+        async with self._send_lock:
+            if self._connection is None:
+                raise UpstreamWebSocketError("Upstream WebSocket connection is closed")
+            native_id = self._current_response_id
+            if not native_id:
+                # 首事件或隐藏轮切换期间暂存一次，后续由 response.created 映射。
+                if self._pending_interrupt is None:
+                    self._pending_interrupt = {
+                        "type": "response.interrupt",
+                        "mode": mode,
+                    }
+                log.info(
+                    "event=upstream_ws_interrupt_deferred connection_id=%s "
+                    "trace_id=%s mode=%s",
+                    self.connection_id, trace_id or "-", mode,
+                )
+                return
+
+            interrupt = {
+                "type": "response.interrupt",
+                "response_id": native_id,
+                "mode": mode,
+            }
+            try:
+                await self._connection.send(
+                    json.dumps(interrupt, ensure_ascii=False, separators=(",", ":"))
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "event=upstream_ws_interrupt_send_failed connection_id=%s "
+                    "trace_id=%s response_id=%s error_type=%s error=%r",
+                    self.connection_id, trace_id or "-", native_id,
+                    type(exc).__name__, exc,
+                )
+                await self._drop_connection()
+                if isinstance(exc, UpstreamWebSocketError):
+                    raise
+                raise UpstreamWebSocketError(
+                    "Upstream WebSocket interrupt send failed"
+                ) from exc
+
+        log.info(
+            "event=upstream_ws_interrupt_forwarded connection_id=%s trace_id=%s "
+            "response_id=%s mode=%s",
+            self.connection_id, trace_id or "-", native_id, mode,
+        )
+
+    def clear_pending_interrupt(self) -> None:
+        """清理当前逻辑请求的待发中断及原生响应控制状态。"""
+        self._pending_interrupt = None
+        self._current_response_id = None
 
     async def _receive_event(
         self, response: UpstreamWebSocketResponse
@@ -501,6 +624,7 @@ class UpstreamWebSocketSession:
     def _release(self, response: UpstreamWebSocketResponse) -> None:
         if self._active is response:
             self._active = None
+            self._current_response_id = None
 
     async def _abort_round(self, response: UpstreamWebSocketResponse) -> None:
         self._release(response)
@@ -510,6 +634,8 @@ class UpstreamWebSocketSession:
         connection = self._connection
         self._connection = None
         self._active = None
+        self._current_response_id = None
+        self._pending_interrupt = None
         if connection is not None:
             with suppress(Exception):
                 await connection.close()

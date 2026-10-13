@@ -371,6 +371,8 @@ async def handle_responses(request: Request) -> Response:
     payload_logger = getattr(request.app.state, "payload_logger", None)
     trace_id = f"http_{uuid.uuid4().hex[:16]}"
     started = time.perf_counter()
+    client_request_id = request.headers.get("x-client-request-id") or "-"
+    llm_router_call_id = request.headers.get("x-llm-router-call-id") or "-"
 
     raw = await request.body()
     try:
@@ -389,9 +391,11 @@ async def handle_responses(request: Request) -> Response:
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
 
     log.info(
-        "event=downstream_request_start trace_id=%s transport=http path=%s "
+        "event=downstream_request_start trace_id=%s client_request_id=%s "
+        "llm_router_call_id=%s transport=http path=%s "
         "model=%s input_items=%d body_bytes=%d",
-        trace_id, request.url.path, body.get("model") or "-",
+        trace_id, client_request_id, llm_router_call_id, request.url.path,
+        body.get("model") or "-",
         len(body.get("input") or []), len(raw),
     )
 
@@ -547,19 +551,119 @@ async def handle_models(request: Request) -> Response:
             await response.aclose()
 
 
+async def _handle_ws_interrupt(
+    websocket: WebSocket,
+    event: dict[str, Any],
+    activity: dict[str, Any],
+) -> None:
+    """校验并把下游 response.interrupt 转发到当前上游响应。"""
+    response_id = event.get("response_id")
+    if not isinstance(response_id, str) or not response_id:
+        await websocket.send_json(
+            _ws_error_event("response_id must be a non-empty string.", param="response_id")
+        )
+        return
+    mode = event.get("mode")
+    if mode != "discard_partial_items":
+        await websocket.send_json(
+            _ws_error_event("mode must be discard_partial_items.", param="mode")
+        )
+        return
+    for key in event:
+        if key not in {"type", "response_id", "mode"}:
+            await websocket.send_json(
+                _ws_error_event("Unexpected field in response.interrupt.", param=key)
+            )
+            return
+
+    trace_id = activity.get("trace_id") or "-"
+    connection_id = activity.get("connection_id") or "-"
+    log.info(
+        "event=downstream_ws_interrupt_received connection_id=%s trace_id=%s "
+        "type=%s response_id=%s mode=%s",
+        connection_id, trace_id, event.get("type"), response_id, mode,
+    )
+
+    request_active = bool(activity.get("request_active"))
+    visible_response_id = activity.get("visible_response_id")
+    session = activity.get("upstream_session")
+    if request_active and response_id == visible_response_id and session is not None:
+        try:
+            await session.send_interrupt(event, trace_id=trace_id)
+        except asyncio.CancelledError:
+            raise
+        except ConnectionError as exc:
+            log.warning(
+                "event=downstream_ws_interrupt_forward_failed connection_id=%s "
+                "trace_id=%s response_id=%s mode=%s error_type=%s error=%r",
+                connection_id, trace_id, response_id, mode, type(exc).__name__, exc,
+            )
+            await _close_active_ws_response(activity)
+            await websocket.send_json(
+                _ws_error_event(
+                    "Upstream WebSocket connection failed.",
+                    status=upstream_websocket_error_status(exc),
+                    code="upstream_connection_error",
+                )
+            )
+            raise
+        log.info(
+            "event=downstream_ws_interrupt_forwarded connection_id=%s trace_id=%s "
+            "type=%s response_id=%s mode=%s",
+            connection_id, trace_id, event.get("type"), response_id, mode,
+        )
+        return
+
+    if (
+        not request_active
+        and response_id == activity.get("last_visible_response_id")
+    ):
+        log.info(
+            "event=downstream_ws_interrupt_ignored connection_id=%s trace_id=%s "
+            "type=%s response_id=%s mode=%s reason=terminal_race",
+            connection_id, trace_id, event.get("type"), response_id, mode,
+        )
+        return
+
+    await websocket.send_json(
+        _ws_error_event("response_id does not match the active response.", param="response_id")
+    )
+
+
 async def _receive_ws_messages(
     websocket: WebSocket,
     inbox: asyncio.Queue[dict[str, Any]],
+    activity: dict[str, Any],
 ) -> dict[str, Any]:
-    """Receive downstream frames until the peer disconnects.
-
-    This runs independently from upstream processing so a disconnect remains
-    observable while ``httpx`` is still waiting for response headers.
-    """
+    """接收下游帧并在响应消费期间即时处理 response.interrupt。"""
     while True:
         message = await websocket.receive()
         if message["type"] == "websocket.disconnect":
             return message
+        if message.get("type") != "websocket.receive":
+            await inbox.put(message)
+            continue
+
+        text = message.get("text")
+        if text is None:
+            data = message.get("bytes")
+            if data is not None:
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    await inbox.put(message)
+                    continue
+        if text is None:
+            await inbox.put(message)
+            continue
+        try:
+            event = json.loads(text)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            await inbox.put(message)
+            continue
+        if isinstance(event, dict) and event.get("type") == "response.interrupt":
+            await _handle_ws_interrupt(websocket, event, activity)
+            continue
         await inbox.put(message)
 
 
@@ -578,6 +682,12 @@ async def _receive_ws_json(inbox: asyncio.Queue[dict[str, Any]]) -> Any:
 
 
 async def _close_active_ws_response(activity: dict[str, Any]) -> None:
+    activity["request_active"] = False
+    activity["visible_response_id"] = None
+    session = activity.get("upstream_session")
+    clear_pending = getattr(session, "clear_pending_interrupt", None)
+    if callable(clear_pending):
+        clear_pending()
     response = activity.pop("response", None)
     if response is not None:
         try:
@@ -603,11 +713,24 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     connection_id = f"ws_{uuid.uuid4().hex[:16]}"
     activity: dict[str, Any] = {
+        # 当前下游连接标识，用于中断日志和连接级校验。
+        "connection_id": connection_id,
+        # 当前连接已处理的 response.create 数量。
         "request_no": 0,
+        # 当前逻辑请求的追踪标识。
         "trace_id": None,
+        # 当前逻辑请求的开始时间。
         "request_started": None,
+        # 当前逻辑请求对应的 HTTP 兼容响应对象。
         "response": None,
+        # 当前连接复用的上游原生 WS 会话。
         "upstream_session": None,
+        # 当前是否处于一个正在消费的逻辑请求。
+        "request_active": False,
+        # 当前下游已见 response.created 的响应 ID。
+        "visible_response_id": None,
+        # 最近一个已结束下游响应的 ID，用于终态竞态忽略。
+        "last_visible_response_id": None,
     }
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     log.info(
@@ -616,7 +739,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     )
 
     receiver = asyncio.create_task(
-        _receive_ws_messages(websocket, inbox),
+        _receive_ws_messages(websocket, inbox, activity),
         name=f"{connection_id}-receiver",
     )
     processor = asyncio.create_task(
@@ -711,6 +834,12 @@ async def _process_responses_ws(
 
         request_no += 1
         activity["request_no"] = request_no
+        activity["request_active"] = False
+        activity["visible_response_id"] = None
+        session = activity.get("upstream_session")
+        clear_pending = getattr(session, "clear_pending_interrupt", None)
+        if callable(clear_pending):
+            clear_pending()
         trace_id = f"{connection_id}.{request_no}"
         request_started = time.perf_counter()
 
@@ -748,6 +877,7 @@ async def _process_responses_ws(
             continue
 
         headers = _ws_upstream_headers(websocket.headers.items(), cfg)
+        activity["request_active"] = True
         upstream_body = body
         request_input = list(upstream_body.get("input") or [])
         should_fold = (not warmup) and _should_fold(cfg, upstream_body)
@@ -821,6 +951,8 @@ async def _process_responses_ws(
             )
             activity["trace_id"] = None
             activity["request_started"] = None
+            activity["request_active"] = False
+            activity["visible_response_id"] = None
             continue
 
         activity["response"] = resp
@@ -836,8 +968,13 @@ async def _process_responses_ws(
                 (time.perf_counter() - request_started) * 1000,
             )
             await websocket.send_json(_upstream_error_event(err, resp.status_code))
+            clear_pending = getattr(upstream_session, "clear_pending_interrupt", None)
+            if callable(clear_pending):
+                clear_pending()
             activity["trace_id"] = None
             activity["request_started"] = None
+            activity["request_active"] = False
+            activity["visible_response_id"] = None
             continue
 
         try:
@@ -859,11 +996,26 @@ async def _process_responses_ws(
                     )
                 )
                 async for ev in event_iter:
+                    if ev.get("type") == "response.created":
+                        response_data = ev.get("response")
+                        response_id = (
+                            response_data.get("id")
+                            if isinstance(response_data, dict) else None
+                        )
+                        if isinstance(response_id, str) and response_id:
+                            activity["visible_response_id"] = response_id
                     if ev.get("type") in (
                         "response.completed",
                         "response.failed",
                         "response.incomplete",
                     ):
+                        response_data = ev.get("response")
+                        response_id = (
+                            response_data.get("id")
+                            if isinstance(response_data, dict) else None
+                        )
+                        if isinstance(response_id, str) and response_id:
+                            activity["last_visible_response_id"] = response_id
                         _remember_response_context(
                             response_contexts,
                             ev.get("response"),
@@ -874,6 +1026,14 @@ async def _process_responses_ws(
             else:
                 try:
                     async for ev in resp.aiter_events():
+                        if ev.get("type") == "response.created":
+                            response_data = ev.get("response")
+                            response_id = (
+                                response_data.get("id")
+                                if isinstance(response_data, dict) else None
+                            )
+                            if isinstance(response_id, str) and response_id:
+                                activity["visible_response_id"] = response_id
                         if warmup and ev.get("type") in (
                             "response.completed",
                             "response.failed",
@@ -887,6 +1047,13 @@ async def _process_responses_ws(
                             "response.failed",
                             "response.incomplete",
                         ):
+                            response_data = ev.get("response")
+                            response_id = (
+                                response_data.get("id")
+                                if isinstance(response_data, dict) else None
+                            )
+                            if isinstance(response_id, str) and response_id:
+                                activity["last_visible_response_id"] = response_id
                             _remember_response_context(
                                 response_contexts,
                                 ev.get("response"),
@@ -926,9 +1093,14 @@ async def _process_responses_ws(
                 "elapsed_ms=%.2f",
                 trace_id, (time.perf_counter() - request_started) * 1000,
             )
+        clear_pending = getattr(upstream_session, "clear_pending_interrupt", None)
+        if callable(clear_pending):
+            clear_pending()
         activity["response"] = None
         activity["trace_id"] = None
         activity["request_started"] = None
+        activity["request_active"] = False
+        activity["visible_response_id"] = None
 
 
 def _make_client() -> httpx.AsyncClient:

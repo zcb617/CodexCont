@@ -37,7 +37,8 @@ _ACCOUNT = "chatgpt-account-id"
 
 # Proxy control headers: consumed by the middleware, never forwarded upstream.
 RESPONSES_API_BASE = "responses-api-base"
-_PROXY_CONTROL = {RESPONSES_API_BASE}
+LLM_ROUTER_CALL_ID = "x-llm-router-call-id"
+_PROXY_CONTROL = {RESPONSES_API_BASE, LLM_ROUTER_CALL_ID}
 
 
 def _has(headers: dict[str, str], name: str) -> bool:

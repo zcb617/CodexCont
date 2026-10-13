@@ -29,6 +29,7 @@ from starlette.testclient import TestClient
 from middleware.app import (
     create_app,
     handle_responses_ws,
+    _handle_ws_interrupt,
     _make_client,
     _resolve_upstream_url,
     _resolve_models_upstream_url,
@@ -50,6 +51,7 @@ from middleware.sse import DONE, incremental_sse
 from middleware.store import IdStore
 from middleware.ws_upstream import (
     UpstreamWebSocketError,
+    UpstreamWebSocketSession,
     connect_upstream_websocket,
     response_create_payload,
     to_websocket_url,
@@ -1069,6 +1071,628 @@ async def test_native_upstream_websocket_reuses_connection():
           sent[1].get("previous_response_id") == "resp_one", str(sent[1]))
     check("native ws session closes its upstream connection", native.closed)
 
+
+
+async def test_native_websocket_interrupt_send_only():
+    """验证 native interrupt 只发送控制帧且不创建新的模型轮次。"""
+    class NativeConnection:
+        def __init__(self):
+            self.sent = []
+            self.incoming = asyncio.Queue()
+            self.recv_started = asyncio.Event()
+            self.active_recv = 0
+            self.max_active_recv = 0
+            self.closed = False
+            self.round_no = 0
+
+        async def send(self, data):
+            event = json.loads(data)
+            self.sent.append(event)
+            if event.get("type") == "response.create":
+                self.round_no += 1
+                response_id = f"native_{self.round_no}"
+                await self.incoming.put({
+                    "type": "response.created",
+                    "response": {"id": response_id, "status": "in_progress"},
+                })
+                if self.round_no == 2:
+                    await self.incoming.put({
+                        "type": "response.completed",
+                        "response": {"id": response_id, "status": "completed", "output": []},
+                    })
+
+        async def recv(self):
+            self.active_recv += 1
+            self.max_active_recv = max(self.max_active_recv, self.active_recv)
+            self.recv_started.set()
+            try:
+                return json.dumps(await self.incoming.get())
+            finally:
+                self.active_recv -= 1
+
+        async def close(self):
+            self.closed = True
+
+    native = NativeConnection()
+    session = UpstreamWebSocketSession(
+        native, url="wss://upstream.test/responses", connection_id="native_interrupt"
+    )
+    first = None
+    first_iter = None
+    waiting = None
+    second = None
+    try:
+        first = await session.open_round(
+            {"model": "gpt-test", "input": [{"role": "user"}]},
+            phase="passthrough",
+            trace_id="trace_interrupt",
+        )
+        first_iter = first.aiter_events()
+        await first_iter.__anext__()
+        native.recv_started.clear()
+        waiting = asyncio.create_task(first_iter.__anext__())
+        await asyncio.wait_for(native.recv_started.wait(), timeout=2)
+        await session.send_interrupt(
+            {
+                "type": "response.interrupt",
+                "response_id": "visible_alias",
+                "mode": "discard_partial_items",
+            },
+            trace_id="trace_interrupt",
+        )
+        sent_interrupt = [
+            event for event in native.sent if event.get("type") == "response.interrupt"
+        ]
+        check(
+            "native interrupt sends mapped control frame without recv",
+            len(sent_interrupt) == 1
+            and sent_interrupt[0].get("response_id") == "native_1"
+            and sent_interrupt[0].get("mode") == "discard_partial_items"
+            and native.max_active_recv == 1,
+            str(native.sent),
+        )
+        await native.incoming.put({
+            "type": "response.completed",
+            "response": {"id": "native_1", "status": "completed", "output": []},
+        })
+        await asyncio.wait_for(waiting, timeout=2)
+        waiting = None
+        await first.aclose()
+        first = None
+        second = await session.open_round(
+            {"model": "gpt-test", "input": [{"role": "user", "content": "next"}]},
+            phase="passthrough",
+            trace_id="trace_next",
+        )
+        [event async for event in second.aiter_events()]
+        await second.aclose()
+        second = None
+        check(
+            "native interrupt does not create a model round",
+            len([event for event in native.sent if event.get("type") == "response.create"]) == 2,
+            str(native.sent),
+        )
+    finally:
+        if waiting is not None and not waiting.done():
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+        if first_iter is not None:
+            await first_iter.aclose()
+        if first is not None:
+            await first.aclose()
+        if second is not None:
+            await second.aclose()
+        await session.aclose()
+
+async def test_websocket_interrupt_during_active_response():
+    """验证下游中断在上游终态前发送且后续 create 保持串行。"""
+    cfg = load_config(ROOT / "config.toml")
+    cfg = replace(cfg, cont=replace(cfg.cont, enabled=False))
+
+    class ControlledResponse:
+        def __init__(self, response_id, release=None):
+            self.status_code = 200
+            self.response_id = response_id
+            self.release = release
+            self.created = asyncio.Event()
+            self.closed = False
+
+        async def aiter_events(self):
+            yield {
+                "type": "response.created",
+                "response": {"id": self.response_id, "status": "in_progress"},
+            }
+            self.created.set()
+            if self.release is not None:
+                await self.release.wait()
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": self.response_id,
+                    "status": "completed",
+                    "output": [],
+                },
+            }
+
+        async def aclose(self):
+            self.closed = True
+
+    class Session:
+        def __init__(self):
+            self.release = asyncio.Event()
+            self.first = ControlledResponse("resp_visible", self.release)
+            self.second = ControlledResponse("resp_next")
+            self.responses = [self.first, self.second]
+            self.index = 0
+            self.interrupt = asyncio.Event()
+            self.interrupts = []
+            self.payloads = []
+
+        async def open_round(self, payload, *, phase, trace_id):
+            self.payloads.append(response_create_payload(payload))
+            response = self.responses[self.index]
+            self.index += 1
+            return response
+
+        async def send_interrupt(self, event, *, trace_id):
+            self.interrupts.append((dict(event), trace_id))
+            self.interrupt.set()
+
+        def clear_pending_interrupt(self):
+            pass
+
+        async def aclose(self):
+            self.release.set()
+
+    session = Session()
+
+    async def connector(**kwargs):
+        return session
+
+    app = SimpleNamespace(state=SimpleNamespace(
+        cfg=cfg,
+        client=FakeClient([]),
+        ws_connector=connector,
+        id_store=IdStore(),
+        payload_logger=None,
+    ))
+    websocket = FakeDownstreamWebSocket(app)
+    first_terminal = asyncio.Event()
+    second_terminal = asyncio.Event()
+    original_send_json = websocket.send_json
+
+    async def send_json(data):
+        await original_send_json(data)
+        if data.get("type") in (
+            "response.completed", "response.failed", "response.incomplete"
+        ):
+            response_id = (data.get("response") or {}).get("id")
+            if response_id == "resp_visible":
+                first_terminal.set()
+            elif response_id == "resp_next":
+                second_terminal.set()
+
+    websocket.send_json = send_json
+    handler = asyncio.create_task(handle_responses_ws(websocket))
+    try:
+        await websocket.send_response_create()
+        await asyncio.wait_for(session.first.created.wait(), timeout=2)
+        await websocket.incoming.put({
+            "type": "websocket.receive",
+            "text": json.dumps({
+                "type": "response.interrupt",
+                "response_id": "resp_visible",
+                "mode": "discard_partial_items",
+            }),
+        })
+        await asyncio.wait_for(session.interrupt.wait(), timeout=2)
+        check(
+            "active websocket interrupt forwards before terminal",
+            len(session.interrupts) == 1
+            and not any(event.get("status") == 400 for event in websocket.sent),
+            str(websocket.sent),
+        )
+        session.release.set()
+        await asyncio.wait_for(first_terminal.wait(), timeout=2)
+        await websocket.incoming.put({
+            "type": "websocket.receive",
+            "text": json.dumps({
+                "type": "response.create",
+                "model": "gpt-5.5",
+                "input": [{"role": "user", "content": "补充"}],
+            }),
+        })
+        await asyncio.wait_for(second_terminal.wait(), timeout=2)
+        check(
+            "active websocket follow-up create is sent once",
+            len(session.payloads) == 2
+            and session.payloads[1].get("input") == [{"role": "user", "content": "补充"}],
+            str(session.payloads),
+        )
+    finally:
+        await websocket.disconnect()
+        try:
+            await asyncio.wait_for(handler, timeout=2)
+        except asyncio.TimeoutError:
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+
+async def test_websocket_interrupt_maps_hidden_round():
+    """验证真实 handle_responses_ws 折叠时中断映射到隐藏轮 native ID。"""
+    cfg = load_config(ROOT / "config.toml")
+
+    class NativeConnection:
+        def __init__(self):
+            self.sent = []
+            self.incoming = asyncio.Queue()
+            self.hidden_opened = asyncio.Event()
+            self.interrupt_sent = asyncio.Event()
+            self.closed = False
+            self.round_no = 0
+
+        async def send(self, data):
+            event = json.loads(data)
+            self.sent.append(event)
+            if event.get("type") == "response.create":
+                self.round_no += 1
+                if self.round_no == 1:
+                    events = await parse_events(_round("rs_first", "ENC_FIRST", 516))
+                    for upstream_event in events:
+                        if isinstance(upstream_event.get("response"), dict):
+                            upstream_event["response"]["id"] = "resp_visible"
+                        await self.incoming.put(upstream_event)
+                elif self.round_no == 2:
+                    self.hidden_opened.set()
+                    await self.incoming.put({
+                        "type": "response.created",
+                        "response": {"id": "resp_hidden", "status": "in_progress"},
+                    })
+                else:
+                    raise AssertionError("unexpected response.create round")
+            elif event.get("type") == "response.interrupt":
+                self.interrupt_sent.set()
+                await self.incoming.put({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_hidden",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 17,
+                            "total_tokens": 117,
+                            "output_tokens_details": {"reasoning_tokens": 17},
+                        },
+                    },
+                })
+
+        async def recv(self):
+            return json.dumps(await self.incoming.get())
+
+        async def close(self):
+            self.closed = True
+
+    native = NativeConnection()
+    session = UpstreamWebSocketSession(
+        native, url="wss://upstream.test/responses", connection_id="hidden"
+    )
+
+    async def connector(**kwargs):
+        return session
+
+    app = SimpleNamespace(state=SimpleNamespace(
+        cfg=cfg,
+        client=FakeClient([]),
+        ws_connector=connector,
+        id_store=IdStore(),
+        payload_logger=None,
+    ))
+    websocket = FakeDownstreamWebSocket(app)
+    visible_created = asyncio.Event()
+    terminal = asyncio.Event()
+    original_send_json = websocket.send_json
+
+    async def send_json(data):
+        await original_send_json(data)
+        if data.get("type") == "response.created":
+            visible_created.set()
+            check(
+                "hidden fold downstream visible created ID",
+                (data.get("response") or {}).get("id") == "resp_visible",
+                str(data),
+            )
+        if data.get("type") in (
+            "response.completed", "response.failed", "response.incomplete"
+        ):
+            terminal.set()
+
+    websocket.send_json = send_json
+    handler = asyncio.create_task(handle_responses_ws(websocket))
+    try:
+        await websocket.send_response_create()
+        await asyncio.wait_for(visible_created.wait(), timeout=2)
+        await asyncio.wait_for(native.hidden_opened.wait(), timeout=2)
+        await websocket.incoming.put({
+            "type": "websocket.receive",
+            "text": json.dumps({
+                "type": "response.interrupt",
+                "response_id": "resp_visible",
+                "mode": "discard_partial_items",
+            }),
+        })
+        await asyncio.wait_for(native.interrupt_sent.wait(), timeout=2)
+        await asyncio.wait_for(terminal.wait(), timeout=2)
+        interrupts = [
+            event for event in native.sent if event.get("type") == "response.interrupt"
+        ]
+        created = [
+            event for event in websocket.sent if event.get("type") == "response.created"
+        ]
+        completed = [
+            event for event in websocket.sent
+            if event.get("type") in (
+                "response.completed", "response.failed", "response.incomplete"
+            )
+        ]
+        metadata = (completed[-1].get("response") or {}).get("metadata") or {}
+        check(
+            "hidden round interrupt targets native response",
+            len(interrupts) == 1
+            and interrupts[0].get("response_id") == "resp_hidden"
+            and interrupts[0].get("mode") == "discard_partial_items",
+            str(native.sent),
+        )
+        check(
+            "hidden fold emits one visible created and two rounds",
+            len(created) == 1
+            and (created[0].get("response") or {}).get("id") == "resp_visible"
+            and len(metadata.get("proxy_rounds") or []) == 2,
+            str(metadata),
+        )
+        check(
+            "hidden fold emits no validation error",
+            not any(event.get("status") == 400 for event in websocket.sent),
+            str(websocket.sent),
+        )
+    finally:
+        await websocket.disconnect()
+        try:
+            await asyncio.wait_for(handler, timeout=2)
+        except asyncio.TimeoutError:
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+        await session.aclose()
+
+async def test_websocket_interrupt_validation_and_terminal_race():
+    """验证中断参数、连接级 ID 校验、终态竞态和未知事件回归。"""
+    class DummyWebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, data):
+            self.sent.append(data)
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        async def send_interrupt(self, event, *, trace_id):
+            self.calls.append(event)
+
+    websocket = DummyWebSocket()
+    session = Session()
+    activity = {
+        "connection_id": "validation",
+        "trace_id": "validation.1",
+        "request_active": True,
+        "visible_response_id": "resp_valid",
+        "last_visible_response_id": None,
+        "upstream_session": session,
+    }
+    cases = [
+        ({"type": "response.interrupt", "mode": "discard_partial_items"}, "response_id"),
+        ({"type": "response.interrupt", "response_id": "", "mode": "discard_partial_items"}, "response_id"),
+        ({"type": "response.interrupt", "response_id": "resp_valid", "mode": "bad"}, "mode"),
+        ({"type": "response.interrupt", "response_id": "resp_valid", "mode": "discard_partial_items", "extra": 1}, "extra"),
+        ({"type": "response.interrupt", "response_id": "unknown", "mode": "discard_partial_items"}, "response_id"),
+        ({"type": "response.interrupt", "response_id": "resp_other_connection", "mode": "discard_partial_items"}, "response_id"),
+    ]
+    for event, param in cases:
+        websocket.sent.clear()
+        await _handle_ws_interrupt(websocket, event, activity)
+        error = websocket.sent[-1] if websocket.sent else {}
+        check(
+            "interrupt validation returns 400 " + param,
+            error.get("status") == 400
+            and error.get("error", {}).get("param") == param,
+            str(websocket.sent),
+        )
+    check(
+        "cross connection response ID is never forwarded",
+        not session.calls,
+        str(session.calls),
+    )
+    activity["request_active"] = False
+    activity["last_visible_response_id"] = "resp_valid"
+    websocket.sent.clear()
+    await _handle_ws_interrupt(
+        websocket,
+        {"type": "response.interrupt", "response_id": "resp_valid",
+         "mode": "discard_partial_items"},
+        activity,
+    )
+    check(
+        "terminal race ignores matching previous response",
+        not websocket.sent and not session.calls,
+    )
+
+    cfg = load_config(ROOT / "config.toml")
+    app = SimpleNamespace(state=SimpleNamespace(
+        cfg=cfg,
+        client=FakeClient([]),
+        ws_connector=FakeWsConnector([FakeResp(_round("unknown", "ENC", 17))]),
+        id_store=IdStore(),
+        payload_logger=None,
+    ))
+    unknown_ws = FakeDownstreamWebSocket(app)
+    unsupported = asyncio.Event()
+    original_send_json = unknown_ws.send_json
+
+    async def capture_unknown(data):
+        await original_send_json(data)
+        if data.get("status") == 400:
+            unsupported.set()
+
+    unknown_ws.send_json = capture_unknown
+    handler = asyncio.create_task(handle_responses_ws(unknown_ws))
+    try:
+        await unknown_ws.incoming.put({
+            "type": "websocket.receive",
+            "text": json.dumps({"type": "response.unknown"}),
+        })
+        await asyncio.wait_for(unsupported.wait(), timeout=2)
+        error = next(event for event in unknown_ws.sent if event.get("status") == 400)
+        check(
+            "unknown event keeps Unsupported response error",
+            error.get("error", {}).get("param") == "type"
+            and "Unsupported event type" in error.get("error", {}).get("message", ""),
+            str(error),
+        )
+        await unknown_ws.send_response_create()
+    finally:
+        await unknown_ws.disconnect()
+        try:
+            await asyncio.wait_for(handler, timeout=2)
+        except asyncio.TimeoutError:
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+
+async def test_native_interrupt_deferred_and_disconnect():
+    """验证首事件未到时待发中断只发送一次并可清理。"""
+    class NativeConnection:
+        def __init__(self):
+            self.sent = []
+            self.incoming = asyncio.Queue()
+            self.create_sent = asyncio.Event()
+            self.closed = False
+            self.round_no = 0
+
+        async def send(self, data):
+            event = json.loads(data)
+            self.sent.append(event)
+            if event.get("type") == "response.create":
+                self.round_no += 1
+                self.create_sent.set()
+                await self.incoming.put({
+                    "type": "response.created",
+                    "response": {
+                        "id": f"resp_{self.round_no}",
+                        "status": "in_progress",
+                    },
+                })
+                if self.round_no > 1:
+                    await self.incoming.put({
+                        "type": "response.completed",
+                        "response": {
+                            "id": f"resp_{self.round_no}",
+                            "status": "completed",
+                            "output": [],
+                        },
+                    })
+            elif event.get("type") == "response.interrupt":
+                await self.incoming.put({
+                    "type": "response.completed",
+                    "response": {
+                        "id": event.get("response_id"),
+                        "status": "completed",
+                        "output": [],
+                    },
+                })
+
+        async def recv(self):
+            return json.dumps(await self.incoming.get())
+
+        async def close(self):
+            self.closed = True
+
+    native = NativeConnection()
+    session = UpstreamWebSocketSession(
+        native, url="wss://upstream.test/responses", connection_id="deferred"
+    )
+    first = None
+    second = None
+    try:
+        await session.send_interrupt(
+            {
+                "type": "response.interrupt",
+                "response_id": "alias",
+                "mode": "discard_partial_items",
+            },
+            trace_id="deferred",
+        )
+        await session.send_interrupt(
+            {
+                "type": "response.interrupt",
+                "response_id": "alias",
+                "mode": "discard_partial_items",
+            },
+            trace_id="deferred",
+        )
+        first = await session.open_round(
+            {"model": "gpt-test", "input": []},
+            phase="passthrough",
+            trace_id="deferred",
+        )
+        first_events = [event async for event in first.aiter_events()]
+        interrupts = [
+            event for event in native.sent if event.get("type") == "response.interrupt"
+        ]
+        check("deferred interrupts merge to one native frame", len(interrupts) == 1)
+        session.clear_pending_interrupt()
+        await session.send_interrupt(
+            {
+                "type": "response.interrupt",
+                "response_id": "alias_fresh",
+                "mode": "discard_partial_items",
+            },
+            trace_id="fresh_pending",
+        )
+        session.clear_pending_interrupt()
+        second = await session.open_round(
+            {"model": "gpt-test", "input": [{"role": "user", "content": "fresh"}]},
+            phase="passthrough",
+            trace_id="fresh",
+        )
+        second_events = [event async for event in second.aiter_events()]
+        interrupts_after_clear = [
+            event for event in native.sent if event.get("type") == "response.interrupt"
+        ]
+        check(
+            "deferred clear prevents new request inheritance",
+            len(interrupts_after_clear) == 1
+            and first_events[-1].get("type") == "response.completed"
+            and second_events[-1].get("type") == "response.completed",
+            str(native.sent),
+        )
+        await session.send_interrupt(
+            {
+                "type": "response.interrupt",
+                "response_id": "alias_disconnect",
+                "mode": "discard_partial_items",
+            },
+            trace_id="disconnect_pending",
+        )
+    finally:
+        if first is not None:
+            await first.aclose()
+        if second is not None:
+            await second.aclose()
+        await session.aclose()
+    check("deferred session closes native connection", native.closed)
+    check(
+        "deferred cleanup clears pending state",
+        session._pending_interrupt is None and session._current_response_id is None,
+    )
 
 async def test_native_upstream_websocket_stream_idle_timeout():
     class IdleConnection:
@@ -2478,6 +3102,11 @@ async def _main():
     await test_eof_incomplete()
     await test_stream_idle_timeout_emits_incomplete_reason()
     await test_native_upstream_websocket_reuses_connection()
+    await test_native_websocket_interrupt_send_only()
+    await test_websocket_interrupt_during_active_response()
+    await test_websocket_interrupt_maps_hidden_round()
+    await test_websocket_interrupt_validation_and_terminal_race()
+    await test_native_interrupt_deferred_and_disconnect()
     await test_native_upstream_websocket_stream_idle_timeout()
     test_http_downstream_keeps_http_upstream()
     test_http_zstd_passthrough_preserves_raw_body_and_header()
