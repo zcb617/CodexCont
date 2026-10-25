@@ -9,6 +9,7 @@ gate — message and function_call output are treated identically.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
@@ -948,6 +949,14 @@ def _synthetic_incomplete(
     return {"type": "response.incomplete", "response": resp, "sequence_number": seq}
 
 
+@dataclass
+class FoldState:
+    """Track hidden continuation and the final native response for one WS request."""
+
+    continued: bool = False  # Whether this logical response opened a hidden round.
+    native_response_id: str | None = None  # Native ID of the last terminal upstream response.
+
+
 async def fold_stream(
     client: httpx.AsyncClient,
     cfg: Config,
@@ -961,6 +970,8 @@ async def fold_stream(
     trace_id: str = "",
     round_opener: Callable[..., Awaitable[Any]] | None = None,
     timeout_cfg: TimeoutCfg | None = None,
+    continuation_input: Callable[[], list[Any]] | None = None,
+    state: FoldState | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield the folded downstream SSE byte stream. `first_response` is the
     already-opened (2xx) round-1 upstream response; later rounds are opened here
@@ -972,6 +983,7 @@ async def fold_stream(
     timeout_cfg = timeout_cfg or cfg.timeouts
     url = url or cfg.upstream.url
     orig_input = list(base_body.get("input") or [])
+    fold_state = state if state is not None else FoldState()
 
     seq = _Seq()
     ds_oi = 0
@@ -1025,6 +1037,12 @@ async def fold_stream(
                     terminal_response = ev.get("response") or {}
                     if not isinstance(terminal_response, dict):
                         terminal_response = {}
+                    native_response_id = terminal_response.get("id")
+                    fold_state.native_response_id = (
+                        native_response_id
+                        if isinstance(native_response_id, str) and native_response_id
+                        else None
+                    )
                     usage = terminal_response.get("usage")
                     terminal_status = terminal_response.get("status") or "-"
                     if t == "response.failed" or terminal_status not in (
@@ -1153,6 +1171,10 @@ async def fold_stream(
             await response.aclose()
 
             if do_continue:
+                if not fold_state.continued and continuation_input is not None:
+                    orig_input = list(continuation_input())
+                fold_state.continued = True
+                fold_state.native_response_id = None
                 last_id = round_reasoning[-1].get("id") or ""
                 if cont.method == "commentary":
                     marker_items = [commentary_message(cont.marker_text)]

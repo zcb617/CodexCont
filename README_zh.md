@@ -104,6 +104,8 @@ Responses-API-Base: https://api.openai.com/v1
 - 下游使用 WebSocket 时，上游使用原生 WebSocket；配置中的 `https://` / `http://` 上游地址会分别映射为 `wss://` / `ws://`。
 - 一条下游 WebSocket 对应一条上游 WebSocket。多轮 `response.create` 以及代理触发的隐藏续写轮次，都会在这条上游连接上按顺序发送。
 
+普通 WebSocket 后续轮次保留客户端提供的 `previous_response_id`，并只发送本轮增量输入。代理仅在内部触发隐藏续写或恢复失败的续写上下文时使用本地历史；隐藏续写成功后，后续轮次通过连接内的原生响应 ID 映射继续增量调用，对外仍表现为一个逻辑响应。
+
 ## 鉴权
 
 `config.toml` 支持三种鉴权模式。示例默认值是 `passthrough`：

@@ -34,6 +34,7 @@ from .config import Config
 from .creds import build_upstream_headers, would_inject_authorization
 from .payload_log import SQLitePayloadLogger
 from .proxy import (
+    FoldState,
     fold_stream,
     observed_response_bytes,
     open_passthrough,
@@ -284,20 +285,15 @@ def _is_ws_warmup(body: dict[str, Any]) -> bool:
 
 
 def _merge_warmup_body(warmup: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Inherit warmup defaults while sending only the current turn to upstream."""
     merged = dict(warmup)
-    warmup_input = list(warmup.get("input") or [])
-    current_input = list(current.get("input") or [])
-
     merged.pop("generate", None)
     merged.pop("input", None)
     merged.pop("previous_response_id", None)
 
     for k, v in current.items():
-        if k not in ("input", "previous_response_id", "generate"):
+        if k != "generate":
             merged[k] = v
-
-    if warmup_input or current_input:
-        merged["input"] = warmup_input + current_input
     return merged
 
 
@@ -884,11 +880,13 @@ async def _process_responses_ws(
     connection_id: str,
     activity: dict[str, Any],
 ) -> None:
+    """Process one downstream WS connection with incremental inputs and local fold history."""
     cfg: Config = websocket.app.state.cfg
     client: httpx.AsyncClient = websocket.app.state.client
     payload_logger = getattr(websocket.app.state, "payload_logger", None)
     warmups: dict[str, dict[str, Any]] = {}
     response_contexts: dict[str, list[Any]] = {}
+    response_aliases: dict[str, str | None] = {}
     request_no = 0
 
     while True:
@@ -928,22 +926,44 @@ async def _process_responses_ws(
         body = {k: v for k, v in msg.items() if k != "type"}
         body.pop("background", None)
         warmup = _is_ws_warmup(body)
+        prev_id = body.get("previous_response_id")
         consumed_prev_id: str | None = None
         if not warmup:
             body["stream"] = True
-            prev_id = body.get("previous_response_id")
+            consumed_prev_id = (
+                prev_id
+                if isinstance(prev_id, str) and prev_id in response_contexts
+                else None
+            )
             if isinstance(prev_id, str) and prev_id in warmups:
                 body = _merge_warmup_body(warmups.pop(prev_id), body)
-            else:
-                body, consumed_prev_id = _merge_previous_response_body(
-                    response_contexts, body
+        context_body = dict(body)
+        resolved_request_input: list[Any] | None = None
+
+        def resolve_request_input() -> list[Any]:
+            """Resolve local history only for a fold continuation or context save."""
+            nonlocal resolved_request_input
+            if resolved_request_input is None:
+                resolved_body, _ = _merge_previous_response_body(
+                    response_contexts, context_body
                 )
+                resolved_request_input = list(resolved_body.get("input") or [])
+            return resolved_request_input
+
+        if not warmup and isinstance(prev_id, str) and prev_id in response_aliases:
+            native_alias = response_aliases[prev_id]
+            if isinstance(native_alias, str) and native_alias:
+                body = dict(body)
+                body["previous_response_id"] = native_alias
+            elif prev_id in response_contexts:
+                body, _ = _merge_previous_response_body(response_contexts, context_body)
 
         log.info(
             "event=downstream_request_start trace_id=%s transport=ws connection_id=%s "
             "request_no=%d model=%s input_items=%d previous_response_id=%s",
             trace_id, connection_id, request_no, body.get("model") or "-",
-            len(body.get("input") or []), "present" if body.get("previous_response_id") else "absent",
+            len(body.get("input") or []),
+            "present" if body.get("previous_response_id") else "absent",
         )
 
         url = _resolve_upstream_url(cfg, websocket)
@@ -961,8 +981,8 @@ async def _process_responses_ws(
         headers = _ws_upstream_headers(websocket.headers.items(), cfg)
         activity["request_active"] = True
         upstream_body = body
-        request_input = list(upstream_body.get("input") or [])
         should_fold = (not warmup) and _should_fold(cfg, upstream_body)
+        fold_state = FoldState() if should_fold else None
 
         activity["trace_id"] = trace_id
         activity["request_started"] = request_started
@@ -1075,6 +1095,8 @@ async def _process_responses_ws(
                         trace_id=trace_id,
                         round_opener=upstream_session.open_round,
                         timeout_cfg=cfg.timeouts,
+                        continuation_input=resolve_request_input,
+                        state=fold_state,
                     )
                 )
                 async for ev in event_iter:
@@ -1101,9 +1123,28 @@ async def _process_responses_ws(
                         _remember_response_context(
                             response_contexts,
                             ev.get("response"),
-                            request_input,
+                            resolve_request_input(),
                             consumed_prev_id,
                         )
+                        if isinstance(response_id, str) and response_id:
+                            if fold_state is not None and fold_state.continued:
+                                response_data = ev.get("response") or {}
+                                response_status = (
+                                    response_data.get("status")
+                                    if isinstance(response_data, dict) else None
+                                )
+                                native_id = fold_state.native_response_id
+                                response_aliases[response_id] = (
+                                    native_id
+                                    if response_status == "completed"
+                                    and isinstance(native_id, str) and native_id
+                                    else None
+                                )
+                            else:
+                                response_aliases.pop(response_id, None)
+                        for alias_id in list(response_aliases):
+                            if alias_id not in response_contexts:
+                                response_aliases.pop(alias_id, None)
                     await websocket.send_json(ev)
             else:
                 try:
@@ -1139,9 +1180,15 @@ async def _process_responses_ws(
                             _remember_response_context(
                                 response_contexts,
                                 ev.get("response"),
-                                request_input,
+                                list(upstream_body.get("input") or [])
+                                if warmup else resolve_request_input(),
                                 consumed_prev_id,
                             )
+                            if isinstance(response_id, str) and response_id:
+                                response_aliases.pop(response_id, None)
+                            for alias_id in list(response_aliases):
+                                if alias_id not in response_contexts:
+                                    response_aliases.pop(alias_id, None)
                         await websocket.send_json(ev)
                 finally:
                     await resp.aclose()

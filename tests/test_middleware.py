@@ -2943,6 +2943,7 @@ async def test_websocket_disconnect_cancels_waiting_upstream():
 
 
 def test_websocket_warmup_generate_false():
+    """验证原生预热完成后，新请求继承默认参数并保持增量输入。"""
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
     warmup_response = make_sse([
@@ -3004,12 +3005,13 @@ def test_websocket_warmup_generate_false():
           str(connector.payloads[:1]))
     merged = connector.payloads[1] if len(connector.payloads) > 1 else {}
     minput = merged.get("input") or []
-    check("ws warmup merges cached input into next upstream request", len(minput) == 2, str(minput))
+    check("ws warmup keeps only the new input in next request",
+          minput == [{"role": "user", "content": "run"}], str(minput))
     check("ws warmup preserves cached tools on next upstream request",
           (merged.get("tools") or [{}])[0].get("name") == "shell",
           str(merged.get("tools")))
-    check("ws warmup strips synthetic previous_response_id before upstream",
-          "previous_response_id" not in merged, str(merged))
+    check("ws warmup keeps native previous_response_id for next request",
+          merged.get("previous_response_id") == "resp_warm_native", str(merged))
 
 
 def test_websocket_preserves_native_previous_response_id():
@@ -3040,7 +3042,8 @@ def test_websocket_preserves_native_previous_response_id():
           sent.get("previous_response_id") == "resp_existing", str(sent))
 
 
-def test_websocket_replays_previous_tool_call_for_output():
+def test_websocket_keeps_previous_tool_output_incremental():
+    """验证普通工具输出轮保留原生 ID 且不重发历史工具调用。"""
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
     tool = {
@@ -3104,24 +3107,23 @@ def test_websocket_replays_previous_tool_call_for_output():
     replayed_types = [
         item.get("type") for item in replayed_input if isinstance(item, dict)
     ]
-    check("tool output replay strips unsupported previous_response_id",
-          "previous_response_id" not in replayed, str(replayed))
-    check("tool output replay includes matching function_call",
-          "function_call" in replayed_types, str(replayed_types))
-    check("tool output replay keeps function_call_output",
-          replayed_types[-1:] == ["function_call_output"], str(replayed_types))
-    call_ids = [
-        item.get("call_id")
-        for item in replayed_input
-        if isinstance(item, dict) and item.get("type") in (
-            "function_call", "function_call_output"
-        )
-    ]
-    check("tool output replay call ids match",
-          call_ids == ["call_replay", "call_replay"], str(call_ids))
+    check("tool output request preserves native previous_response_id",
+          replayed.get("previous_response_id") == response_id, str(replayed))
+    check("tool output request sends only the new output",
+          replayed_input == [{
+              "type": "function_call_output",
+              "call_id": "call_replay",
+              "output": "/app",
+          }], str(replayed_input))
+    check("tool output request does not resend old function_call",
+          "function_call" not in replayed_types, str(replayed_types))
+    check("tool output request has one call_replay id",
+          [item.get("call_id") for item in replayed_input
+           if isinstance(item, dict)] == ["call_replay"], str(replayed_input))
 
 
 def test_websocket_response_contexts_are_connection_local():
+    """验证两个 WS 连接各自发送自己的增量工具输出而不串历史。"""
     cfg = load_config(ROOT / "config.toml")
     app = create_app(cfg)
     tool_a = {
@@ -3139,8 +3141,10 @@ def test_websocket_response_contexts_are_connection_local():
         "arguments": "{}",
     }
     connector = FakeWsConnector([
-        FakeResp(_round("rs_a", "ENC_A", 999, extra_items=[tool_a])),
-        FakeResp(_round("rs_b", "ENC_B", 999, extra_items=[tool_b])),
+        FakeResp(_round("rs_a", "ENC_A", 999, extra_items=[tool_a]).replace(
+            b"resp_x", b"resp_connection_a")),
+        FakeResp(_round("rs_b", "ENC_B", 999, extra_items=[tool_b]).replace(
+            b"resp_x", b"resp_connection_b")),
         FakeResp(_round("rs_done_a", "ENC_DONE_A", 999, msg="a done")),
         FakeResp(_round("rs_done_b", "ENC_DONE_B", 999, msg="b done")),
     ])
@@ -3204,10 +3208,23 @@ def test_websocket_response_contexts_are_connection_local():
 
     payload_a = connector.payloads[2] if len(connector.payloads) > 2 else {}
     payload_b = connector.payloads[3] if len(connector.payloads) > 3 else {}
-    check("connection a replays only its own function call",
-          replayed_call_ids(payload_a) == ["call_connection_a"], str(payload_a))
-    check("connection b replays only its own function call",
-          replayed_call_ids(payload_b) == ["call_connection_b"], str(payload_b))
+    check("connection a keeps its response id and sends only its own output",
+          payload_a.get("previous_response_id") == response_a
+          and payload_a.get("input") == [{
+              "type": "function_call_output",
+              "call_id": "call_connection_a",
+              "output": "a",
+          }], str(payload_a))
+    check("connection b keeps its response id and sends only its own output",
+          payload_b.get("previous_response_id") == response_b
+          and payload_b.get("input") == [{
+              "type": "function_call_output",
+              "call_id": "call_connection_b",
+              "output": "b",
+          }], str(payload_b))
+    check("connection requests do not resend either old function call",
+          not replayed_call_ids(payload_a) and not replayed_call_ids(payload_b),
+          str((payload_a, payload_b)))
 
 
 def test_payload_sqlite_records_ws_rounds():
@@ -3466,7 +3483,7 @@ async def _main():
     await test_websocket_disconnect_cancels_waiting_upstream()
     test_websocket_warmup_generate_false()
     test_websocket_preserves_native_previous_response_id()
-    test_websocket_replays_previous_tool_call_for_output()
+    test_websocket_keeps_previous_tool_output_incremental()
     test_websocket_response_contexts_are_connection_local()
     test_payload_sqlite_records_ws_rounds()
     test_payload_sqlite_initialized_on_startup()
