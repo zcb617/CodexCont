@@ -7,6 +7,7 @@ No pytest dependency — a tiny runner prints PASS/FAIL per check.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import sqlite3
@@ -2234,6 +2235,343 @@ def test_models_upstream_status_body_and_transport_errors():
         )
 
 
+def test_search_post_proxy_transparent_request_and_response():
+    """Verify both search aliases transparently forward raw request and response data."""
+    base = load_config(ROOT / "config.example.toml")
+    cfg = replace(base, auth=replace(base.auth, mode="passthrough"))
+    raw_bodies = [
+        b'{ "query": "example", "stream": true, "reasoning": {"effort":"high"} }',
+        zstd.ZstdCompressor().compress(b"not-json-search-body"),
+    ]
+    paths = ("/v1/alpha/search", "/backend-api/codex/alpha/search")
+
+    for index, (path, raw) in enumerate(zip(paths, raw_bodies)):
+        class TrackingResp(FakeResp):
+            def __init__(self, *args, **kwargs):
+                # Tracks whether the search proxy closed the fully read upstream response.
+                self.closed = False
+                super().__init__(*args, **kwargs)
+
+            async def aclose(self) -> None:
+                # Records response cleanup after transparent body forwarding.
+                self.closed = True
+
+        response_body = b'{ "results": ["unchanged"] }'
+        upstream_response = TrackingResp(
+            response_body,
+            status=201,
+            headers={
+                "content-type": "application/json; charset=utf-8",
+                "x-request-id": "search-request-1",
+                "retry-after": "3",
+                "etag": '"search-v1"',
+                "connection": "keep-alive, x-hop",
+                "x-hop": "drop",
+                "transfer-encoding": "chunked",
+            },
+        )
+        app = create_app(cfg)
+        fake = FakeClient([upstream_response])
+        request_headers = {
+            "Authorization": "Bearer agent-token",
+            "chatgpt-account-id": "acct-search",
+            "Responses-API-Base": "https://chatgpt.com/backend-api/codex",
+            "User-Agent": "search-test",
+            "Content-Type": "application/json",
+            "X-Search-Test": "keep",
+        }
+        if index == 1:
+            request_headers["Content-Encoding"] = "zstd"
+
+        with TestClient(app) as client:
+            app.state.client = fake
+            response = client.post(
+                path + "?tag=a%20b&tag=c%2Bd&empty=",
+                content=raw,
+                headers=request_headers,
+            )
+
+        check(f"search alias {path} returns upstream status", response.status_code == 201,
+              str(response.status_code))
+        check(f"search alias {path} preserves response bytes", response.content == response_body,
+              repr(response.content))
+        check(
+            f"search alias {path} preserves business response headers",
+            response.headers.get("content-type") == "application/json; charset=utf-8"
+            and response.headers.get("x-request-id") == "search-request-1"
+            and response.headers.get("retry-after") == "3"
+            and response.headers.get("etag") == '"search-v1"',
+            str(dict(response.headers)),
+        )
+        check(
+            f"search alias {path} removes hop-by-hop response headers",
+            all(name not in response.headers for name in
+                ("connection", "x-hop", "transfer-encoding")),
+            str(dict(response.headers)),
+        )
+        check(f"search alias {path} sends one POST", len(fake.requests) == 1
+              and fake.requests[0].get("method") == "POST", str(fake.requests))
+        request = fake.requests[0] if fake.requests else {}
+        check(f"search alias {path} sends exact request bytes", request.get("content") == raw,
+              repr(request.get("content")))
+        check(
+            f"search alias {path} preserves encoded query string",
+            request.get("url") ==
+            "https://chatgpt.com/backend-api/codex/alpha/search?tag=a%20b&tag=c%2Bd&empty=",
+            str(request.get("url")),
+        )
+        sent_headers = {
+            str(name).lower(): str(value)
+            for name, value in (request.get("headers") or {}).items()
+        }
+        check(
+            f"search alias {path} forwards business request headers",
+            sent_headers.get("authorization") == "Bearer agent-token"
+            and sent_headers.get("chatgpt-account-id") == "acct-search"
+            and sent_headers.get("user-agent") == "search-test"
+            and sent_headers.get("content-type") == "application/json"
+            and sent_headers.get("x-search-test") == "keep"
+            and (index == 0 or sent_headers.get("content-encoding") == "zstd"),
+            str(sent_headers),
+        )
+        check(
+            f"search alias {path} strips proxy control request headers",
+            all(name not in sent_headers for name in
+                ("host", "content-length", "responses-api-base")),
+            str(sent_headers),
+        )
+        check(
+            f"search alias {path} uses small request timeout",
+            request.get("timeout") == cfg.timeouts.small_timeout_s,
+            str(request.get("timeout")),
+        )
+        check(f"search alias {path} closes upstream response", upstream_response.closed)
+
+    gzip_raw = gzip.compress(b'{"results":["gzip"]}')
+    app = create_app(cfg)
+    real_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=gzip_raw,
+                headers={
+                    "content-type": "application/json",
+                    "content-encoding": "gzip",
+                },
+            )
+        ),
+        timeout=None,
+    )
+    with TestClient(app) as client:
+        app.state.client = real_client
+        response = client.post("/v1/alpha/search", content=b"{}")
+    decoded = b'{"results":["gzip"]}'
+    check("search decodes compressed upstream bytes once", response.status_code == 200
+          and response.content == decoded, repr(response.content))
+    check("search removes decoded content encoding", "content-encoding" not in response.headers,
+          str(dict(response.headers)))
+    check("search reports decoded content length",
+          response.headers.get("content-length") == str(len(decoded)),
+          str(response.headers.get("content-length")))
+
+
+def test_search_upstream_routing_and_auth_guard():
+    """Verify search follows configured routing modes and the credential safety guard."""
+    base = load_config(ROOT / "config.example.toml")
+    base_url = "https://fixed.test/v1/responses?source=cfg"
+    request_path = "/v1/alpha/search?dup=a&dup=b"
+    cases = [
+        (
+            "fixed mode ignores override",
+            replace(base, upstream=replace(base.upstream, url=base_url, mode="fixed")),
+            {"Responses-API-Base": "https://wrong.test/v1"},
+            "https://fixed.test/v1/alpha/search?source=cfg&dup=a&dup=b",
+            200,
+            None,
+        ),
+        (
+            "header mode uses configured URL without override",
+            replace(base, upstream=replace(base.upstream, url=base_url, mode="header")),
+            {},
+            "https://fixed.test/v1/alpha/search?source=cfg&dup=a&dup=b",
+            200,
+            None,
+        ),
+        (
+            "header mode applies override",
+            replace(base, upstream=replace(base.upstream, url=base_url, mode="header")),
+            {"Responses-API-Base": "https://override.test/v1"},
+            "https://override.test/v1/alpha/search?dup=a&dup=b",
+            200,
+            None,
+        ),
+        (
+            "required header rejects missing override",
+            replace(base, upstream=replace(base.upstream, mode="header_required")),
+            {},
+            None,
+            400,
+            None,
+        ),
+        (
+            "required header allows passthrough credentials",
+            replace(
+                base,
+                upstream=replace(base.upstream, mode="header_required"),
+                auth=replace(base.auth, mode="passthrough"),
+            ),
+            {
+                "Responses-API-Base": "https://override.test/v1",
+                "Authorization": "Bearer agent-token",
+            },
+            "https://override.test/v1/alpha/search?dup=a&dup=b",
+            200,
+            "Bearer agent-token",
+        ),
+        (
+            "injected credentials are blocked for override",
+            replace(
+                base,
+                upstream=replace(base.upstream, mode="header"),
+                auth=replace(base.auth, mode="inject", access_token="configured-token"),
+            ),
+            {"Responses-API-Base": "https://override.test/v1"},
+            None,
+            400,
+            None,
+        ),
+        (
+            "configured fallback credentials are injected",
+            replace(
+                base,
+                upstream=replace(base.upstream, mode="header"),
+                auth=replace(
+                    base.auth,
+                    mode="passthrough_then_inject",
+                    access_token="configured-token",
+                ),
+            ),
+            {},
+            "https://chatgpt.com/backend-api/codex/alpha/search?dup=a&dup=b",
+            200,
+            "Bearer configured-token",
+        ),
+    ]
+
+    for label, cfg, request_headers, expected_url, expected_status, expected_auth in cases:
+        app = create_app(cfg)
+        fake = FakeClient([FakeResp(b"search")])
+        with TestClient(app) as client:
+            app.state.client = fake
+            response = client.post(request_path, content=b"{}", headers=request_headers)
+        check(f"search routing {label} returns expected status",
+              response.status_code == expected_status, str(response.status_code))
+        if expected_url is None:
+            check(f"search routing {label} skips upstream request", not fake.requests,
+                  str(fake.requests))
+        else:
+            request = fake.requests[0] if fake.requests else {}
+            check(f"search routing {label} selects expected URL",
+                  request.get("url") == expected_url, str(request.get("url")))
+            sent_headers = {
+                str(name).lower(): str(value)
+                for name, value in (request.get("headers") or {}).items()
+            }
+            if expected_auth is not None:
+                check(f"search routing {label} sends expected Authorization",
+                      sent_headers.get("authorization") == expected_auth, str(sent_headers))
+
+
+def test_search_upstream_status_body_and_transport_errors():
+    """Verify search preserves upstream failures and maps transport errors normally."""
+    cfg = load_config(ROOT / "config.example.toml")
+    cfg = replace(cfg, auth=replace(cfg.auth, mode="passthrough"))
+    raw = b"upstream search failed: unchanged"
+
+    for status in (401, 403, 429, 500):
+        class TrackingResp(FakeResp):
+            def __init__(self, *args, **kwargs):
+                # Tracks cleanup of each completed upstream HTTP response.
+                self.closed = False
+                super().__init__(*args, **kwargs)
+
+            async def aclose(self) -> None:
+                # Records that the status and body were read before the response closed.
+                self.closed = True
+
+        upstream_response = TrackingResp(
+            raw,
+            status=status,
+            headers={
+                "content-type": "text/plain; charset=utf-8",
+                "retry-after": "7",
+            },
+        )
+        app = create_app(cfg)
+        fake = FakeClient([upstream_response])
+        with TestClient(app) as client:
+            app.state.client = fake
+            response = client.post("/v1/alpha/search", content=b"{}")
+        check(f"search preserves upstream status {status}", response.status_code == status,
+              str(response.status_code))
+        check(f"search preserves upstream body {status}", response.content == raw,
+              repr(response.content))
+        check(
+            f"search preserves upstream headers {status}",
+            response.headers.get("content-type") == "text/plain; charset=utf-8"
+            and response.headers.get("retry-after") == "7",
+            str(dict(response.headers)),
+        )
+        check(f"search sends one request for status {status}", len(fake.requests) == 1,
+              str(fake.requests))
+        check(f"search closes upstream status response {status}", upstream_response.closed)
+
+    for exc, expected_status, label in (
+        (httpx.ReadError("read failed"), 502, "ReadError"),
+        (httpx.ReadTimeout("timed out"), 504, "ReadTimeout"),
+    ):
+        app = create_app(cfg)
+        failing = _RaisingClient(exc)
+        with TestClient(app, raise_server_exceptions=True) as client:
+            app.state.client = failing
+            response = client.post("/v1/alpha/search", content=b"{}")
+        body = response.json()
+        err = body.get("error") if isinstance(body, dict) else None
+        check(f"search {label} maps status", response.status_code == expected_status,
+              str(response.status_code))
+        check(
+            f"search {label} maps structured error",
+            isinstance(err, dict)
+            and err.get("code") == "upstream_transport_error"
+            and err.get("type") == label,
+            str(body),
+        )
+
+    class ReadFailResp(FakeResp):
+        def __init__(self):
+            # Tracks cleanup when consuming the upstream response body fails.
+            self.closed = False
+            super().__init__(b"ignored")
+
+        async def aread(self) -> bytes:
+            # Simulates a transport failure while the response body is being read.
+            raise httpx.ReadError("body read failed")
+
+        async def aclose(self) -> None:
+            # Records cleanup even when the response body could not be consumed.
+            self.closed = True
+
+    read_failure = ReadFailResp()
+    app = create_app(cfg)
+    fake = FakeClient([read_failure])
+    with TestClient(app, raise_server_exceptions=True) as client:
+        app.state.client = fake
+        response = client.post("/v1/alpha/search", content=b"{}")
+    check("search body read error maps to 502", response.status_code == 502,
+          str(response.status_code))
+    check("search body read error closes upstream response", read_failure.closed)
+
+
 def test_first_byte_timeout_policy_uses_serialized_body_size():
     cfg = load_config(ROOT / "config.example.toml")
     policy = cfg.timeouts
@@ -3117,6 +3455,9 @@ async def _main():
     test_models_config_and_url_resolution()
     test_models_get_proxy_transparent_response_and_headers()
     test_models_upstream_status_body_and_transport_errors()
+    test_search_post_proxy_transparent_request_and_response()
+    test_search_upstream_routing_and_auth_guard()
+    test_search_upstream_status_body_and_transport_errors()
     test_first_byte_timeout_policy_uses_serialized_body_size()
     await test_first_byte_timeout_on_headers()
     await test_first_byte_and_stream_idle_timeouts()

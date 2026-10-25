@@ -100,6 +100,19 @@ def _resolve_models_upstream_url(cfg: Config, request: Request) -> str:
     return str(base)
 
 
+def _resolve_search_upstream_url(cfg: Config, request: Request) -> str | None:
+    """Resolve the upstream alpha search URL while retaining both query strings."""
+    url = _resolve_upstream_url(cfg, request)
+    if url is None:
+        return None
+    base = httpx.URL(url)
+    path = base.path.rstrip("/").removesuffix("/responses") + "/alpha/search"
+    upstream_query = base.query
+    downstream_query = request.scope.get("query_string", b"")
+    query = b"&".join(part for part in (upstream_query, downstream_query) if part)
+    return str(base.copy_with(path=path, query=query))
+
+
 def _url_is_from_header(cfg: Config, request: Request) -> bool:
     return cfg.upstream.mode in ("header", "header_required") and _header_base(request) is not None
 
@@ -547,6 +560,75 @@ async def handle_models(request: Request) -> Response:
         return _http_upstream_transport_response(exc, trace_id=trace_id, started=started)
     finally:
         # Closing is required on both success and error after consuming raw bytes.
+        if response is not None:
+            await response.aclose()
+
+
+async def handle_search(request: Request) -> Response:
+    """Proxy Codex alpha search as a raw POST without Responses processing."""
+    cfg: Config = request.app.state.cfg
+    client: httpx.AsyncClient = request.app.state.client
+    trace_id = f"search_{uuid.uuid4().hex[:16]}"
+    started = time.perf_counter()
+    url = _resolve_search_upstream_url(cfg, request)
+    if url is None:
+        return JSONResponse(
+            {"error": "Responses-API-Base header is required (upstream mode=header_required)"},
+            status_code=400,
+        )
+    error = _header_override_error(cfg, request, model=None)
+    if error:
+        return JSONResponse({"error": error}, status_code=400)
+
+    raw = await request.body()
+    headers = build_upstream_headers(request.headers.items(), cfg)
+    log.info(
+        "event=search_request_start trace_id=%s transport=http path=%s",
+        trace_id, request.url.path,
+    )
+    response: Any | None = None
+    try:
+        upstream_request = client.build_request(
+            "POST",
+            url,
+            headers=headers,
+            content=raw,
+            timeout=cfg.timeouts.small_timeout_s,
+        )
+        response = await client.send(upstream_request, stream=True)
+        raw_response = await response.aread()
+        excluded_headers = {
+            "content-encoding",
+            "content-length",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        }
+        connection_header = response.headers.get("connection", "")
+        excluded_headers.update(
+            name.strip().lower() for name in connection_header.split(",") if name.strip()
+        )
+        response_headers = {
+            name.lower(): value
+            for name, value in response.headers.items()
+            if name.lower() not in excluded_headers
+        }
+        status = response.status_code
+        log.info(
+            "event=search_request_end trace_id=%s transport=http outcome=upstream_response "
+            "upstream_status=%s elapsed_ms=%.2f",
+            trace_id, status, (time.perf_counter() - started) * 1000,
+        )
+        return Response(raw_response, status_code=status, headers=response_headers)
+    except httpx.HTTPError as exc:
+        return _http_upstream_transport_response(exc, trace_id=trace_id, started=started)
+    finally:
         if response is not None:
             await response.aclose()
 
@@ -1134,6 +1216,10 @@ def create_app(cfg: Config) -> Starlette:
     routes = [
         Route(path, handle_models, methods=["GET"]) for path in cfg.server.models_paths
     ]
+    routes.extend(
+        Route(path, handle_search, methods=["POST"])
+        for path in ("/v1/alpha/search", "/backend-api/codex/alpha/search")
+    )
     routes.extend(
         Route(path, handle_responses, methods=["POST"]) for path in cfg.server.listen_paths
     )
