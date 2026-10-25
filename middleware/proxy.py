@@ -33,9 +33,9 @@ from .sse import DONE, incremental_sse, serialize_done, serialize_event
 
 log = logging.getLogger("middleware.proxy")
 
-# Wall-clock budget from request start until the first final-output delta.
-# Metadata and reasoning summaries do not reset it; final-output chunks use a
-# reset-on-each-output idle budget.
+# Wall-clock budget from request start until an output delta or reasoning item
+# starts streaming. Metadata and reasoning summaries do not reset it; recognized
+# activity then uses a reset-on-each-event idle budget.
 FIRST_BYTE_TIMEOUT_S = 60.0
 FIRST_BYTE_TIMEOUT_MEDIUM_S = 180.0
 FIRST_BYTE_TIMEOUT_LARGE_S = 300.0
@@ -74,22 +74,32 @@ class UpstreamStreamIdleTimeout(ConnectionError):
 
 
 class UpstreamGenerationTimeout(ConnectionError):
-    """No final-output delta arrived within the size-based budget."""
+    """No output delta or reasoning item arrived within the size-based budget."""
 
     status_code = 504
 
 
 def is_generation_delta_event(event: Any) -> bool:
-    """Return true only when continuous final output has started.
+    """Identify output deltas and reasoning item lifecycle activity.
 
-    Reasoning-summary deltas are progress within the generation/thinking phase;
-    they must not switch the request from its size-based generation budget to
-    the much shorter stream-idle budget.
+    Only the existing output deltas and reasoning item added/done events switch
+    from the size-based generation budget to the shorter stream-idle budget.
     """
     if not isinstance(event, dict):
         return False
     event_type = event.get("type")
-    return event_type in _STREAM_OUTPUT_DELTA_TYPES
+    # 旧判断只覆盖正文与工具的三种输出 delta。
+    # return event_type in _STREAM_OUTPUT_DELTA_TYPES
+    if not isinstance(event_type, str):
+        return False
+    if event_type in _STREAM_OUTPUT_DELTA_TYPES:
+        return True
+    item = event.get("item")
+    return (
+        event_type in ("response.output_item.added", "response.output_item.done")
+        and isinstance(item, dict)
+        and item.get("type") == "reasoning"
+    )
 
 
 def _mark_generation_started(response: Any) -> None:
@@ -140,9 +150,9 @@ def _record_upstream_event(response: Any, event: Any) -> None:
         recent.append(event_type)
         del recent[:-_RECENT_EVENT_TYPES_LIMIT]
 
-    # The whitelist is used only to enter the streaming phase. Once entered,
-    # every upstream event proves the stream is active and resets its idle
-    # deadline, regardless of event type.
+    # Existing output deltas or reasoning items enter the streaming phase.
+    # Once entered, every upstream event proves the stream is active and resets
+    # its idle deadline, regardless of event type.
     if stream_was_started:
         diag["last_generation_at"] = now_mono
 
@@ -153,8 +163,13 @@ def _record_upstream_event(response: Any, event: Any) -> None:
             diag.get("reasoning_delta_count") or 0
         ) + 1
 
-    if event_type in _STREAM_OUTPUT_DELTA_TYPES:
+    # 旧判断只由正文与工具的三种输出 delta 启动流式阶段。
+    # if event_type in _STREAM_OUTPUT_DELTA_TYPES:
+    #     _mark_generation_started(response)
+    if is_generation_delta_event(event):
         _mark_generation_started(response)
+
+    if event_type in _STREAM_OUTPUT_DELTA_TYPES:
         diag["last_output_delta_type"] = event_type
         diag["last_output_delta_at"] = now_wall
         diag["last_output_delta_monotonic"] = now_mono
@@ -420,8 +435,8 @@ async def observed_response_bytes(response: Any) -> AsyncIterator[bytes]:
         yield first_chunk
 
         # Metadata and reasoning summaries do not reset the size-based
-        # generation deadline. Once final output starts, each output delta
-        # resets the shorter idle budget.
+        # generation deadline. The first recognized output delta or reasoning
+        # item starts streaming; each later event refreshes the shorter idle budget.
         while True:
             generation_started = bool(diag.get("generation_started"))
             if generation_started:
